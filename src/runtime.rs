@@ -69,7 +69,6 @@ impl Runtime {
             fader_speed_dead: w.get_fader_speed_dead(),
             playfield_fit: w.get_playfield_fit(),
             diagnostics: w.get_diagnostics(),
-            api_enabled: true,
             api_port: w.get_api_port().clamp(1, 65535) as u16,
             light_keys: w.get_light_keys(),
             flip_vertical: w.get_flip_vertical(),
@@ -390,6 +389,7 @@ impl Runtime {
         let weak = w.as_weak();
         let api = self.api.clone();
         let installed = std::cell::Cell::new(false);
+        let nav_generation = std::cell::Cell::new(0u64);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let t = slint::Timer::default();
         t.start(
@@ -414,17 +414,19 @@ impl Runtime {
                 Self::sync_keys_enabled(&bridge, &w);
 
                 if w.get_nav_active() {
-                    nav.capture_tick();
-                    let frame = nav.take_frame();
-                    w.set_nav_status(frame.status.clone().into());
-                    if frame.width > 0 && frame.height > 0 && !frame.bgra.is_empty() {
-                        let rgba = crate::navmirror::bgra_to_rgba(&frame.bgra);
-                        let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                            &rgba,
-                            frame.width,
-                            frame.height,
+                    if let Some(frame) = nav.take_frame_after(nav_generation.get()) {
+                        nav_generation.set(frame.generation);
+                        w.set_nav_status(
+                            format!("{} · {:.1} ms", frame.status, frame.capture_ms).into(),
                         );
-                        w.set_nav_frame(Image::from_rgba8(buf));
+                        if frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty() {
+                            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                                &frame.rgba,
+                                frame.width,
+                                frame.height,
+                            );
+                            w.set_nav_frame(Image::from_rgba8(buf));
+                        }
                     }
                 }
 

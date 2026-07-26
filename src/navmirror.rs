@@ -1,32 +1,54 @@
 use crate::monitor::MonInfo;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone, Default)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
+    pub rgba: Vec<u8>,
     pub status: String,
+    pub generation: u64,
+    pub capture_ms: f32,
 }
 
 pub struct NavMirror {
-    running: AtomicBool,
+    shared: Arc<CaptureShared>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    running: bool,
+    stop: bool,
+    target: Option<MonInfo>,
+    epoch: u64,
+}
+
+struct CaptureShared {
+    state: Mutex<CaptureState>,
+    wake: Condvar,
     frame: Mutex<Frame>,
-    target: Mutex<Option<MonInfo>>,
-    max_w: u32,
 }
 
 impl NavMirror {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            running: AtomicBool::new(false),
+        let shared = Arc::new(CaptureShared {
+            state: Mutex::new(CaptureState::default()),
+            wake: Condvar::new(),
             frame: Mutex::new(Frame {
                 status: "idle".into(),
                 ..Frame::default()
             }),
-            target: Mutex::new(None),
-            max_w: 1920,
+        });
+        let worker_shared = shared.clone();
+        let worker = std::thread::Builder::new()
+            .name("nav-capture".into())
+            .spawn(move || capture_worker(worker_shared, 1920))
+            .map_err(|e| log::error!("could not start nav capture worker: {e}"))
+            .ok();
+        Arc::new(Self {
+            shared,
+            worker: Mutex::new(worker),
         })
     }
 
@@ -34,58 +56,58 @@ impl NavMirror {
         if target.same_screen(pad) {
             return Err("Nav monitor must be different from Pad monitor".into());
         }
-        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
-        self.running.store(true, Ordering::Relaxed);
+        if self
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return Err("Nav capture worker unavailable".into());
+        }
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.target = Some(target);
+            state.running = true;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
         self.set_status("capturing…");
+        self.shared.wake.notify_one();
         Ok(())
     }
 
     pub fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running = false;
+        self.shared.wake.notify_one();
         inject_mouse_up(self);
         self.set_status("idle");
     }
 
     fn set_status(&self, s: &str) {
-        if let Ok(mut f) = self.frame.lock() {
+        if let Ok(mut f) = self.shared.frame.lock() {
             f.status = s.into();
+            f.generation = f.generation.wrapping_add(1);
         }
     }
 
-    pub fn capture_tick(&self) {
-        if !self.running.load(Ordering::Relaxed) {
-            return;
-        }
-        let target = self
-            .target
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(mon) = target else { return };
-        match capture_monitor(&mon, self.max_w) {
-            Ok(frame) => {
-                *self.frame.lock().unwrap_or_else(|e| e.into_inner()) = frame;
-            }
-            Err(e) => self.set_status(&format!("capture failed: {e}")),
-        }
-    }
-
-    pub fn take_frame(&self) -> Frame {
-        self.frame.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    pub fn take_frame_after(&self, generation: u64) -> Option<Frame> {
+        let frame = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+        (frame.generation != generation).then(|| frame.clone())
     }
 
     pub fn pointer(&self, nx: f32, ny: f32, kind: i32) {
-        if !self.running.load(Ordering::Relaxed) {
-            return;
-        }
-        let mon = match self
-            .target
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            Some(m) => m,
-            None => return,
+        let mon = {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.running {
+                return;
+            }
+            match state.target.clone() {
+                Some(m) => m,
+                None => return,
+            }
         };
         let nx = nx.clamp(0.0, 1.0);
         let ny = ny.clamp(0.0, 1.0);
@@ -96,6 +118,73 @@ impl NavMirror {
             1 => inject_mouse(x, y, MouseOp::Move),
             _ => inject_mouse(x, y, MouseOp::Up),
         }
+    }
+}
+
+impl Drop for NavMirror {
+    fn drop(&mut self) {
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.running = false;
+            state.stop = true;
+        }
+        self.shared.wake.notify_all();
+        if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
+    loop {
+        let (target, epoch) = {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            while !state.running && !state.stop {
+                state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            if state.stop {
+                return;
+            }
+            (state.target.clone(), state.epoch)
+        };
+        let Some(mon) = target else { continue };
+
+        let started = std::time::Instant::now();
+        let result = capture_monitor(&mon, max_w);
+        let elapsed = started.elapsed();
+        {
+            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.running || state.epoch != epoch {
+                continue;
+            }
+        }
+        let mut frame = shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = frame.generation.wrapping_add(1);
+        match result {
+            Ok(mut next) => {
+                next.generation = generation;
+                next.capture_ms = elapsed.as_secs_f32() * 1000.0;
+                if elapsed > std::time::Duration::from_millis(33) {
+                    log::warn!("nav capture took {:.1} ms", next.capture_ms);
+                }
+                *frame = next;
+            }
+            Err(e) => {
+                frame.status = format!("capture failed: {e}");
+                frame.generation = generation;
+                frame.capture_ms = elapsed.as_secs_f32() * 1000.0;
+            }
+        }
+        drop(frame);
+
+        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stop {
+            return;
+        }
+        let _ = shared
+            .wake
+            .wait_timeout(state, std::time::Duration::from_millis(33))
+            .unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -203,9 +292,11 @@ fn inject_mouse_up(_nav: &NavMirror) {}
 #[cfg(windows)]
 fn inject_mouse_up(nav: &NavMirror) {
     let mon = nav
-        .target
+        .shared
+        .state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .target
         .clone()
         .unwrap_or(MonInfo {
             index: 0,
@@ -329,12 +420,13 @@ fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
         Ok(Frame {
             width: dst_w,
             height: dst_h,
-            bgra,
+            rgba: bgra_to_rgba(&bgra),
             status: if dst_w == src_w {
                 format!("NAV  {src_w}×{src_h}  ·  touch = main screen")
             } else {
                 format!("NAV  {src_w}×{src_h}→{dst_w}×{dst_h}  ·  touch = main screen")
             },
+            ..Frame::default()
         })
     }
 }
@@ -353,4 +445,89 @@ pub fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(index: usize) -> MonInfo {
+        MonInfo {
+            index,
+            left: index as i32 * 100,
+            top: 0,
+            width: 100,
+            height: 100,
+            primary: index == 0,
+            device: format!("display-{index}"),
+            label: format!("Display {index}"),
+        }
+    }
+
+    #[test]
+    fn bgra_conversion_is_rgba_and_opaque() {
+        assert_eq!(
+            bgra_to_rgba(&[3, 2, 1, 9, 30, 20, 10, 0]),
+            vec![1, 2, 3, 255, 10, 20, 30, 255]
+        );
+    }
+
+    #[test]
+    fn frame_generation_only_yields_new_frames() {
+        let nav = NavMirror::new();
+        let first = nav.take_frame_after(u64::MAX).expect("initial frame");
+        assert!(nav.take_frame_after(first.generation).is_none());
+        nav.set_status("changed");
+        let changed = nav
+            .take_frame_after(first.generation)
+            .expect("changed frame");
+        assert_eq!(changed.status, "changed");
+        assert_ne!(changed.generation, first.generation);
+    }
+
+    #[test]
+    fn same_monitor_is_rejected() {
+        let nav = NavMirror::new();
+        let mon = monitor(0);
+        assert!(nav.start(mon.clone(), &mon).is_err());
+    }
+
+    #[test]
+    fn start_retarget_stop_updates_state() {
+        let nav = NavMirror::new();
+        let pad = monitor(0);
+        let nav_mon = monitor(1);
+        let other = monitor(2);
+
+        assert!(nav.start(nav_mon.clone(), &pad).is_ok());
+        {
+            let state = nav.shared.state.lock().unwrap();
+            assert!(state.running);
+            assert_eq!(state.target.as_ref().map(|m| m.index), Some(1));
+            assert_eq!(state.epoch, 1);
+        }
+
+        assert!(nav.start(other, &pad).is_ok());
+        {
+            let state = nav.shared.state.lock().unwrap();
+            assert!(state.running);
+            assert_eq!(state.target.as_ref().map(|m| m.index), Some(2));
+            assert_eq!(state.epoch, 2);
+        }
+
+        nav.stop();
+        {
+            let state = nav.shared.state.lock().unwrap();
+            assert!(!state.running);
+        }
+        let frame = nav.take_frame_after(u64::MAX).expect("status frame");
+        assert_eq!(frame.status, "idle");
+    }
+
+    #[test]
+    fn worker_stops_cleanly() {
+        let nav = NavMirror::new();
+        nav.stop();
+        drop(nav);
+    }
 }

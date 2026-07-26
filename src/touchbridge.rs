@@ -100,6 +100,8 @@ pub struct Bridge {
 struct State {
     hwnd: isize,
     win: Option<slint::Weak<PChordWindow>>,
+    install_thread: Option<std::thread::ThreadId>,
+    thread_mismatch_logged: bool,
     primary: Option<u32>,
     slots: [Option<u32>; MT_SLOTS],
     stats: Stats,
@@ -117,6 +119,8 @@ impl Default for State {
         State {
             hwnd: 0,
             win: None,
+            install_thread: None,
+            thread_mismatch_logged: false,
             primary: None,
             slots: [None; MT_SLOTS],
             stats: Stats::default(),
@@ -195,6 +199,13 @@ impl State {
     fn clear_all_keys(&mut self) -> Vec<(usize, bool)> {
         self.contact_key.clear();
         self.recompute_held()
+    }
+
+    fn reset_contacts(&mut self) -> Vec<(usize, bool)> {
+        self.primary = None;
+        self.slots.fill(None);
+        self.recount();
+        self.clear_all_keys()
     }
 
     fn recompute_held(&mut self) -> Vec<(usize, bool)> {
@@ -303,6 +314,38 @@ impl Bridge {
         let h = self.lock().hwnd;
         h != 0 && h == hwnd
     }
+
+    #[cfg(windows)]
+    fn verify_callback_thread(&self) {
+        let current = std::thread::current().id();
+        let should_log = {
+            let mut st = self.lock();
+            let mismatch = st
+                .install_thread
+                .is_some_and(|installed| installed != current);
+            if mismatch && !st.thread_mismatch_logged {
+                st.thread_mismatch_logged = true;
+                true
+            } else {
+                false
+            }
+        };
+        if should_log {
+            log::error!("touch callback arrived off the Slint installation thread");
+        }
+    }
+
+    #[cfg(windows)]
+    fn reset(&self) {
+        let edges = {
+            let mut st = self.lock();
+            st.hwnd = 0;
+            st.win = None;
+            st.install_thread = None;
+            st.reset_contacts()
+        };
+        self.emit_edges(edges);
+    }
 }
 
 #[cfg(not(windows))]
@@ -396,11 +439,23 @@ mod win {
         }
         {
             let mut st = bridge.lock();
+            if st.hwnd == hwnd as isize {
+                return true;
+            }
             st.hwnd = hwnd as isize;
             st.win = Some(weak);
+            st.install_thread = Some(std::thread::current().id());
+            st.thread_mismatch_logged = false;
         }
         set_no_activate(hwnd);
-        install_subclass(bridge, hwnd)
+        let installed = install_subclass(bridge, hwnd);
+        if !installed {
+            let mut st = bridge.lock();
+            st.hwnd = 0;
+            st.win = None;
+            st.install_thread = None;
+        }
+        installed
     }
 
     fn set_no_activate(hwnd: HWND) {
@@ -614,6 +669,9 @@ mod win {
             return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
         if msg == WM_NCDESTROY {
+            let bridge = &*(refdata as *const Bridge);
+            bridge.verify_callback_thread();
+            bridge.reset();
             RemoveWindowSubclass(hwnd, Some(subclass_proc), id);
             let res = DefSubclassProc(hwnd, msg, wparam, lparam);
             drop(Arc::from_raw(refdata as *const Bridge));
@@ -621,6 +679,7 @@ mod win {
         }
 
         let bridge = &*(refdata as *const Bridge);
+        bridge.verify_callback_thread();
 
         if (msg == WM_POINTERACTIVATE || msg == WM_MOUSEACTIVATE) && bridge.is_mine(hwnd as isize) {
             return MA_NOACTIVATE as LRESULT;
@@ -836,5 +895,25 @@ mod tests {
         st.stats.live = 0;
         let edges = st.track_key(1, 45.0, 150.0, true);
         assert_eq!(edges, vec![(0, false)]);
+    }
+
+    #[test]
+    fn reset_contacts_releases_everything() {
+        let mut st = State {
+            key_geom: geom(),
+            ..State::default()
+        };
+        down(&mut st, 1, 45.0, 150.0);
+        down(&mut st, 2, 145.0, 150.0);
+        st.track_key(1, 45.0, 150.0, false);
+        st.track_key(2, 145.0, 150.0, false);
+
+        let edges = st.reset_contacts();
+
+        assert_eq!(st.stats.live, 0);
+        assert!(st.primary.is_none());
+        assert!(st.slots.iter().all(Option::is_none));
+        assert!(edges.contains(&(0, false)));
+        assert!(edges.contains(&(1, false)));
     }
 }

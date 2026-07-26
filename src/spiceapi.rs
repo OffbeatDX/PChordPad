@@ -39,11 +39,18 @@ impl Client {
             status: Mutex::new(format!("connecting to 127.0.0.1:{port}")),
         });
         let worker = {
-            let shared = shared.clone();
-            std::thread::Builder::new()
+            let shared_for_thread = shared.clone();
+            match std::thread::Builder::new()
                 .name("spiceapi".into())
-                .spawn(move || run(shared, port))
-                .ok()
+                .spawn(move || run(shared_for_thread, port))
+            {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    set_status(&shared, false, format!("worker spawn failed: {e}"));
+                    log::error!("spiceapi worker spawn failed: {e}");
+                    None
+                }
+            }
         };
         Client {
             shared,
@@ -335,9 +342,11 @@ mod tests {
     #[test]
     fn speaks_the_wire_protocol() {
         use std::net::TcpListener;
+        use std::sync::mpsc;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
 
         let server = std::thread::spawn(move || {
             let (sock, _) = listener.accept().expect("accept");
@@ -359,6 +368,7 @@ mod tests {
                 let _ = sock.write_all(&out);
                 msgs.push(v);
             }
+            let _ = done_tx.send(());
             drop(reader);
             drop(sock);
             msgs
@@ -366,9 +376,19 @@ mod tests {
 
         {
             let client = Client::start(port);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !client.connected() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for spiceapi connect"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             client.button("Button 7", true);
             client.faders(1.0, -1.0);
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("server should finish both requests");
         }
 
         let msgs = server.join().expect("server thread");

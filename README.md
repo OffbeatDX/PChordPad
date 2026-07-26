@@ -15,7 +15,7 @@ Touch pad for PChord under [spice2x](https://spice2x.github.io/).
 
 ## Build
 
-Requires [Rust](https://rustup.rs/).
+Requires [Rust](https://rustup.rs/) **1.92+**.
 
 ```
 create-release.bat

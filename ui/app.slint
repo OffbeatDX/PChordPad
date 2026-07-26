@@ -1,0 +1,935 @@
+import { Theme } from "theme.slint";
+import { MultiTouch } from "multitouch.slint";
+import { PChordPanel } from "pchord.slint";
+import { MonitorSelect, ToggleTile, SliderRow } from "settings.slint";
+
+export { MultiTouch, Theme }
+
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <color> tint: Theme.text1;
+    spacing: 0px;
+    Text {
+        text: root.label;
+        color: Theme.text3;
+        font-size: 8px;
+        font-weight: 700;
+        letter-spacing: 1px;
+    }
+    Text {
+        text: root.value;
+        color: root.tint;
+        font-size: 19px;
+        font-weight: 800;
+    }
+}
+
+component SlotDot inherits Rectangle {
+    in property <int> index;
+    in property <bool> active;
+    in property <length> px;
+    in property <length> py;
+    min-width: 72px;
+    height: 22px;
+    border-radius: 3px;
+    horizontal-stretch: 1;
+    background: root.active ? Theme.accent-a.with-alpha(0.18) : Theme.surface2.with-alpha(0.5);
+    border-width: 1px;
+    border-color: root.active ? Theme.accent-a : Theme.border;
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 10px;
+        color: root.active ? Theme.accent-a : Theme.text3;
+        text: root.active
+            ? root.index + ": " + Math.round(root.px / 1px) + "," + Math.round(root.py / 1px)
+            : root.index + ": —";
+    }
+}
+
+component FaderReadout inherits HorizontalLayout {
+    in property <string> label;
+    in property <float> value;
+    in property <int> dir;
+    in property <bool> grabbed;
+    in property <color> accent: Theme.accent-a;
+    spacing: 8px;
+    horizontal-stretch: 1;
+    Text {
+        text: root.label;
+        font-size: 11px;
+        font-weight: 700;
+        color: Theme.text3;
+        vertical-alignment: center;
+    }
+    Text {
+        text: (root.value >= 0 ? "+" : "") + Math.round(root.value * 1000) / 1000;
+        font-size: 12px;
+        font-weight: 700;
+        color: Theme.text1;
+        vertical-alignment: center;
+    }
+    Text {
+        text: "raw " + Math.round((root.value * 0.5 + 0.5) * 1000) / 1000;
+        font-size: 11px;
+        color: Theme.text3;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.dir == 0 ? "·" : (root.dir < 0 ? "<" : ">");
+        font-size: 12px;
+        font-weight: 700;
+        color: root.dir == 0 ? Theme.text3 : root.accent;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.grabbed ? "GRAB" : (root.value != 0 ? "SPRING" : "REST");
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        color: root.grabbed ? root.accent : Theme.text3;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+    }
+}
+
+export component PChordWindow inherits Window {
+    in property <string> window-title: "Polaris Chord — Touch Controller";
+    in property <string> app-version;
+    title: root.window-title;
+    icon: @image-url("../assets/icon.png");
+    default-font-family: "Segoe UI";
+    background: Theme.bg;
+    no-frame: !root.windowed;
+    preferred-width: 1600px;
+    preferred-height: 900px;
+    min-width: 900px;
+    min-height: 600px;
+
+    callback quit();
+    callback settings-changed();
+
+    in-out property <bool> diagnostics: false;
+    in-out property <bool> settings-open: false;
+
+    in property <int> live-contacts;
+    in property <int> peak-contacts;
+    in property <int> dropped-contacts;
+    in property <string> latency;
+    in property <string> api-status;
+    in property <bool> api-connected;
+    in property <int> digital-events;
+    in property <int> analog-events;
+    in property <[bool]> keys;
+    in property <[string]> log;
+
+    in-out property <float> fader-curve: 1.0;
+    in-out property <float> fader-dead: 0.04;
+    in-out property <duration> fader-tick: 16ms;
+    in-out property <float> fader-decay: 0.7;
+    in-out property <bool> relative-faders: true;
+    in-out property <float> fader-rel-travel: 100.0;
+    in-out property <float> fader-speed-dead: 2.5;
+    in-out property <float> playfield-fit: 1.0;
+    in-out property <int> api-port: 1337;
+    in-out property <bool> light-keys: false;
+    in-out property <bool> flip-vertical: false;
+    in-out property <bool> windowed: false;
+    in-out property <int> pad-monitor: 0;
+    in-out property <int> nav-monitor: 0;
+    in property <[string]> monitor-options;
+    property <string> settings-help: "";
+    property <length> settings-help-abs-x: 0px;
+    property <length> settings-help-abs-y: 0px;
+
+    in-out property <bool> nav-active: false;
+    in property <image> nav-frame;
+    in property <string> nav-status: "";
+    callback nav-toggled();
+    callback nav-pointer(float, float, int);
+
+    out property <float> panel-y: root.band-h / 1px;
+    out property <float> key-geom-x: panel.key-geom-x;
+    out property <float> key-geom-y: panel.key-geom-y;
+    out property <float> key-geom-w: panel.key-geom-w;
+    out property <float> key-geom-h: panel.key-geom-h;
+    out property <float> key-geom-key-w: panel.key-geom-key-w;
+    out property <float> key-geom-gap: panel.key-geom-gap;
+    out property <bool> keys-interactive: !root.settings-open && !root.nav-active;
+
+    callback analog(string, float);
+    callback mouse-key(float, float, bool);
+
+    property <length> band-h: root.diagnostics ? 110px : 0px;
+    in property <bool> mouse-keys: false;
+
+    panel := PChordPanel {
+        x: 0;
+        y: root.band-h;
+        width: root.width;
+        height: max(1px, root.height - root.band-h);
+        interactive: !root.settings-open && !root.nav-active;
+        mt-enabled: !root.settings-open && !root.nav-active;
+        key-held: root.keys;
+        fader-curve: root.fader-curve;
+        fader-dead: root.fader-dead;
+        fader-tick: root.fader-tick;
+        fader-decay: root.fader-decay;
+        relative-faders: root.relative-faders;
+        fader-rel-travel: root.fader-rel-travel * 1px;
+        fader-speed-dead: root.fader-speed-dead * 1px;
+        fit: root.playfield-fit;
+        light-keys: root.light-keys;
+        analog(n, v) => { root.analog(n, v); }
+    }
+
+    if root.mouse-keys : TouchArea {
+        x: root.key-geom-x * 1px;
+        y: (root.panel-y + root.key-geom-y) * 1px;
+        width: root.key-geom-w * 1px;
+        height: root.key-geom-h * 1px;
+        moved => {
+            root.mouse-key(
+                root.key-geom-x + self.mouse-x / 1px,
+                root.panel-y + root.key-geom-y + self.mouse-y / 1px,
+                false);
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.mouse-key(
+                    root.key-geom-x + self.mouse-x / 1px,
+                    root.panel-y + root.key-geom-y + self.mouse-y / 1px,
+                    false);
+            }
+            if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                root.mouse-key(
+                    root.key-geom-x + self.mouse-x / 1px,
+                    root.panel-y + root.key-geom-y + self.mouse-y / 1px,
+                    true);
+            }
+        }
+    }
+
+    Rectangle {
+        x: 8px;
+        y: 8px;
+        width: 44px;
+        height: 44px;
+        border-radius: 6px;
+        background: gear-ta.pressed ? Theme.surface2 : #00000066;
+        border-width: 1px;
+        border-color: Theme.border;
+        z: 20;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "⚙";
+            font-size: 22px;
+            color: Theme.text1;
+        }
+        gear-ta := TouchArea {
+            clicked => { root.settings-open = !root.settings-open; }
+        }
+    }
+
+    Rectangle {
+        x: 60px;
+        y: 8px;
+        width: 64px;
+        height: 44px;
+        border-radius: 6px;
+        background: root.nav-active
+            ? (nav-ta.pressed ? Theme.accent-a.with-alpha(0.55) : Theme.accent-a.with-alpha(0.35))
+            : (nav-ta.pressed ? Theme.surface2 : #00000066);
+        border-width: 1px;
+        border-color: root.nav-active ? Theme.accent-a : Theme.border;
+        z: 20;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: root.nav-active ? "PAD" : "NAV";
+            font-size: 14px;
+            font-weight: 800;
+            letter-spacing: 1px;
+            color: root.nav-active ? Theme.accent-a : Theme.text1;
+        }
+        nav-ta := TouchArea {
+            clicked => {
+                root.nav-active = !root.nav-active;
+                root.nav-toggled();
+            }
+        }
+    }
+
+    if root.nav-active : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000;
+        z: 12;
+
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.nav-frame;
+            image-fit: fill;
+        }
+
+        nav-surface := TouchArea {
+            moved => {
+                if (self.pressed) {
+                    root.nav-pointer(
+                        self.mouse-x / parent.width,
+                        self.mouse-y / parent.height,
+                        1);
+                }
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    root.nav-pointer(
+                        self.mouse-x / parent.width,
+                        self.mouse-y / parent.height,
+                        0);
+                }
+                if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    root.nav-pointer(
+                        self.mouse-x / parent.width,
+                        self.mouse-y / parent.height,
+                        2);
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        x: root.width - 52px;
+        y: 8px;
+        width: 44px;
+        height: 44px;
+        border-radius: 6px;
+        background: close-win-ta.pressed ? Theme.danger-hover : #00000066;
+        border-width: 1px;
+        border-color: Theme.border;
+        z: 20;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "X";
+            font-family: "Segoe UI";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text1;
+        }
+        close-win-ta := TouchArea {
+            clicked => { root.quit(); }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.up) {
+                    root.quit();
+                }
+            }
+        }
+    }
+
+    if root.settings-open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000aa;
+        z: 30;
+        TouchArea {
+            clicked => {
+                root.settings-open = false;
+                root.settings-help = "";
+                root.settings-changed();
+            }
+        }
+
+        settings-panel := Rectangle {
+            x: max(24px, (root.width - self.width) / 2);
+            y: max(50px, (root.height - self.height) / 2);
+            width: min(760px, root.width * 0.7);
+            property <length> max-h: root.height - 100px;
+            property <length> chrome: 20px + settings-title.height + 12px + 12px + 52px + 20px;
+            property <length> body-pref: settings-body.preferred-height;
+            property <bool> fits: self.chrome + self.body-pref <= self.max-h;
+            property <length> body-h: self.fits ? self.body-pref : self.max-h - self.chrome;
+            height: self.chrome + self.body-h;
+            border-radius: 10px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                settings-title := HorizontalLayout {
+                    height: 28px;
+                    Text {
+                        text: "SETTINGS";
+                        font-size: 22px;
+                        font-weight: 800;
+                        letter-spacing: 2px;
+                        color: Theme.text1;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: root.app-version;
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: Theme.text3;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Flickable {
+                    height: settings-panel.body-h;
+                    viewport-width: self.width;
+                    viewport-height: settings-body.preferred-height;
+                    flicked => { root.settings-help = ""; }
+
+                    settings-body := VerticalLayout {
+                        width: 100%;
+                        spacing: 14px;
+
+                        MonitorSelect {
+                            label: "Game Monitor";
+                            help: "Which display Nav mode mirrors and sends clicks to (usually the game / primary). Must differ from Pad Monitor.";
+                            active-help: root.settings-help;
+                            options: root.monitor-options;
+                            current-index <=> root.nav-monitor;
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        MonitorSelect {
+                            label: "Pad Monitor";
+                            help: "Which display hosts this controller (keys/faders). SAVE repositions the window when Windowed mode is off.";
+                            active-help: root.settings-help;
+                            options: root.monitor-options;
+                            current-index <=> root.pad-monitor;
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            ToggleTile {
+                                label: "Relative faders";
+                                help: "Swipe direction sets fader value. Hold still to keep value; reverse past the speed deadzone snaps to 0 then the other side. Off = absolute position on the track.";
+                                active-help: root.settings-help;
+                                checked <=> root.relative-faders;
+                                ask-help(t, ax, ay) => {
+                                    if root.settings-help == t {
+                                        root.settings-help = "";
+                                    } else {
+                                        root.settings-help = t;
+                                        root.settings-help-abs-x = ax;
+                                        root.settings-help-abs-y = ay;
+                                    }
+                                }
+                                dismiss-help => {
+                                    root.settings-help = "";
+                                }
+                            }
+                            ToggleTile {
+                                label: "Light keys";
+                                help: "Milky white keys with warm orange press glow. Off = original dark keys with teal→violet press colours.";
+                                active-help: root.settings-help;
+                                checked <=> root.light-keys;
+                                ask-help(t, ax, ay) => {
+                                    if root.settings-help == t {
+                                        root.settings-help = "";
+                                    } else {
+                                        root.settings-help = t;
+                                        root.settings-help-abs-x = ax;
+                                        root.settings-help-abs-y = ay;
+                                    }
+                                }
+                                dismiss-help => {
+                                    root.settings-help = "";
+                                }
+                            }
+                            ToggleTile {
+                                label: "Flip pad 180°";
+                                help: "Rotates the Pad Monitor in Windows display settings (not the UI). Use for an upside-down mounted touchscreen. Restores to 0° when turned off or on quit.";
+                                active-help: root.settings-help;
+                                checked <=> root.flip-vertical;
+                                ask-help(t, ax, ay) => {
+                                    if root.settings-help == t {
+                                        root.settings-help = "";
+                                    } else {
+                                        root.settings-help = t;
+                                        root.settings-help-abs-x = ax;
+                                        root.settings-help-abs-y = ay;
+                                    }
+                                }
+                                dismiss-help => {
+                                    root.settings-help = "";
+                                }
+                            }
+                            ToggleTile {
+                                label: "Windowed mode";
+                                help: "Adds a normal window frame and stops pinning the controller to the Pad Monitor.";
+                                active-help: root.settings-help;
+                                checked <=> root.windowed;
+                                ask-help(t, ax, ay) => {
+                                    if root.settings-help == t {
+                                        root.settings-help = "";
+                                    } else {
+                                        root.settings-help = t;
+                                        root.settings-help-abs-x = ax;
+                                        root.settings-help-abs-y = ay;
+                                    }
+                                }
+                                dismiss-help => {
+                                    root.settings-help = "";
+                                }
+                            }
+                            ToggleTile {
+                                label: "Diagnostics";
+                                help: "Top band with live touch contacts, SpiceAPI status, key lamps, and a short event log. For setup/debug — turn off for play.";
+                                active-help: root.settings-help;
+                                checked <=> root.diagnostics;
+                                ask-help(t, ax, ay) => {
+                                    if root.settings-help == t {
+                                        root.settings-help = "";
+                                    } else {
+                                        root.settings-help = t;
+                                        root.settings-help-abs-x = ax;
+                                        root.settings-help-abs-y = ay;
+                                    }
+                                }
+                                dismiss-help => {
+                                    root.settings-help = "";
+                                }
+                            }
+                        }
+
+                        SliderRow {
+                            label: "Playfield fit";
+                            help: "How wide the keys/faders sit in the window. 100% = edge to edge; lower shrinks the playfield toward the center.";
+                            active-help: root.settings-help;
+                            min-v: 0.0;
+                            max-v: 1.0;
+                            default-value: 1.0;
+                            value <=> root.playfield-fit;
+                            display: Math.round(root.playfield-fit * 100) + "%";
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Spring decay";
+                            help: "How fast a released fader returns to center. Higher = snappier spring; lower = slower glide back to 0.";
+                            active-help: root.settings-help;
+                            min-v: 0.4;
+                            max-v: 0.95;
+                            default-value: 0.7;
+                            value <=> root.fader-decay;
+                            display: Math.round(root.fader-decay * 100) / 100;
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Abs deadzone";
+                            help: "Absolute mode only: center region that reads as 0 so tiny finger jitter does not move the fader.";
+                            active-help: root.settings-help;
+                            min-v: 0.0;
+                            max-v: 0.2;
+                            default-value: 0.04;
+                            value <=> root.fader-dead;
+                            display: Math.round(root.fader-dead * 1000) / 1000;
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Rel travel (px)";
+                            help: "Relative mode: finger pixels needed to sweep full scale (−1→+1). Lower = more sensitive; higher = needs a longer swipe.";
+                            active-help: root.settings-help;
+                            min-v: 40.0;
+                            max-v: 240.0;
+                            default-value: 100.0;
+                            value <=> root.fader-rel-travel;
+                            display: Math.round(root.fader-rel-travel) + "px";
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Speed deadzone (px)";
+                            help: "Relative mode: movement smaller than this (per sample) is ignored so resting your finger holds the value.";
+                            active-help: root.settings-help;
+                            min-v: 0.5;
+                            max-v: 12.0;
+                            default-value: 2.5;
+                            value <=> root.fader-speed-dead;
+                            display: Math.round(root.fader-speed-dead * 10) / 10 + "px";
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Response curve";
+                            help: "Shapes fader response. 1.0 = linear. Above 1 = finer near center (less sensitive at rest). Below 1 = hotter near center.";
+                            active-help: root.settings-help;
+                            min-v: 0.5;
+                            max-v: 2.0;
+                            default-value: 1.0;
+                            value <=> root.fader-curve;
+                            display: Math.round(root.fader-curve * 100) / 100;
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 52px;
+                    border-radius: 5px;
+                    background: apply-ta.pressed ? Theme.accent-a.with-alpha(0.5) : Theme.accent-a.with-alpha(0.25);
+                    border-width: 1px;
+                    border-color: Theme.accent-a;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "SAVE";
+                        font-size: 16px;
+                        font-weight: 800;
+                        letter-spacing: 2px;
+                        color: Theme.accent-a;
+                    }
+                    apply-ta := TouchArea {
+                        clicked => {
+                            root.settings-open = false;
+                            root.settings-help = "";
+                            root.settings-changed();
+                        }
+                    }
+                }
+            }
+
+            if root.settings-help != "" : help-card := Rectangle {
+                width: min(300px, parent.width - 24px);
+                height: help-col.preferred-height;
+                x: clamp(
+                    root.settings-help-abs-x - settings-panel.absolute-position.x + 26px,
+                    12px,
+                    parent.width - self.width - 12px);
+                y: clamp(
+                    root.settings-help-abs-y - settings-panel.absolute-position.y - 4px,
+                    12px,
+                    parent.height - self.height - 12px);
+                z: 40;
+                border-radius: 8px;
+                background: Theme.surface2;
+                border-width: 1px;
+                border-color: Theme.accent-a.with-alpha(0.45);
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000cc;
+
+                help-col := VerticalLayout {
+                    width: 100%;
+                    padding: 12px;
+                    spacing: 6px;
+                    Text {
+                        width: 100%;
+                        text: root.settings-help;
+                        font-size: 13px;
+                        color: Theme.text1;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "Tap ? again to dismiss";
+                        font-size: 11px;
+                        color: Theme.text3;
+                    }
+                }
+            }
+        }
+    }
+
+    if root.diagnostics : diag-band := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.band-h;
+        background: Theme.surface.with-alpha(0.82);
+        z: 10;
+        clip: true;
+        Rectangle {
+            y: parent.height - 1px;
+            height: 1px;
+            background: Theme.border;
+        }
+
+        property <length> side-pad: 60px;
+        property <length> strip-pad: 8px;
+        property <length> top-strip-h: 36px;
+        property <length> bot-strip-h: diag-band.height - 2 * diag-band.strip-pad - diag-band.top-strip-h - 8px;
+
+        HorizontalLayout {
+            x: diag-band.side-pad;
+            y: diag-band.strip-pad;
+            width: diag-band.width - 2 * diag-band.side-pad;
+            height: diag-band.top-strip-h;
+            spacing: 20px;
+            alignment: center;
+
+            Stat {
+                label: "LIVE";
+                value: root.live-contacts;
+            }
+            Stat {
+                label: "PEAK";
+                value: root.peak-contacts;
+                tint: root.peak-contacts >= 8 ? Theme.ok : Theme.text1;
+            }
+            Stat {
+                label: "DROPPED";
+                value: root.dropped-contacts;
+                tint: root.dropped-contacts > 0 ? Theme.bad : Theme.text3;
+            }
+
+            Rectangle {
+                width: 1px;
+                height: 28px;
+                background: Theme.border;
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+                Text {
+                    text: "latency " + root.latency;
+                    font-size: 11px;
+                    color: Theme.text2;
+                }
+                Text {
+                    text: root.digital-events + " dig / " + root.analog-events + " an";
+                    font-size: 11px;
+                    color: Theme.text3;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    y: 6px;
+                    border-radius: 4px;
+                    background: root.api-connected ? Theme.ok : Theme.text3;
+                }
+                Text {
+                    text: "spiceapi " + root.api-status;
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: root.api-connected ? Theme.ok : Theme.text3;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle {
+                width: 1px;
+                height: 28px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                for on[i] in root.keys : Rectangle {
+                    height: 26px;
+                    horizontal-stretch: 1;
+                    min-width: 18px;
+                    border-radius: 3px;
+                    background: on
+                        ? (root.light-keys ? Theme.key-lit : Theme.accent-a.mix(Theme.accent-b, 1.0 - i / 11.0))
+                        : Theme.surface2.with-alpha(0.6);
+                    border-width: 1px;
+                    border-color: on
+                        ? (root.light-keys ? Theme.key-lit : Theme.accent-a)
+                        : Theme.border;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: i + 1;
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: on ? Theme.text-on-accent : Theme.text3;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            x: diag-band.side-pad;
+            y: diag-band.strip-pad + diag-band.top-strip-h + 8px;
+            width: diag-band.width - 2 * diag-band.side-pad;
+            height: diag-band.bot-strip-h;
+            spacing: 16px;
+            alignment: start;
+
+            VerticalLayout {
+                spacing: 2px;
+                width: 300px;
+                height: 100%;
+                alignment: start;
+                FaderReadout {
+                    label: "FADER-L";
+                    value: panel.fader-l;
+                    dir: panel.dir-l;
+                    grabbed: panel.grabbed-l;
+                    accent: Theme.fader-l;
+                }
+                FaderReadout {
+                    label: "FADER-R";
+                    value: panel.fader-r;
+                    dir: panel.dir-r;
+                    grabbed: panel.grabbed-r;
+                    accent: Theme.fader-r;
+                }
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                height: 100%;
+                alignment: start;
+                Text {
+                    text: "TOUCH SLOTS";
+                    font-size: 9px;
+                    font-weight: 700;
+                    letter-spacing: 1px;
+                    color: Theme.text3;
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    SlotDot { index: 0; active: MultiTouch.a0; px: MultiTouch.x0; py: MultiTouch.y0; }
+                    SlotDot { index: 1; active: MultiTouch.a1; px: MultiTouch.x1; py: MultiTouch.y1; }
+                    SlotDot { index: 2; active: MultiTouch.a2; px: MultiTouch.x2; py: MultiTouch.y2; }
+                    SlotDot { index: 3; active: MultiTouch.a3; px: MultiTouch.x3; py: MultiTouch.y3; }
+                    SlotDot { index: 4; active: MultiTouch.a4; px: MultiTouch.x4; py: MultiTouch.y4; }
+                    SlotDot { index: 5; active: MultiTouch.a5; px: MultiTouch.x5; py: MultiTouch.y5; }
+                    SlotDot { index: 6; active: MultiTouch.a6; px: MultiTouch.x6; py: MultiTouch.y6; }
+                    SlotDot { index: 7; active: MultiTouch.a7; px: MultiTouch.x7; py: MultiTouch.y7; }
+                    SlotDot { index: 8; active: MultiTouch.a8; px: MultiTouch.x8; py: MultiTouch.y8; }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                min-width: 220px;
+                height: 100%;
+                clip: true;
+                background: Theme.bg.with-alpha(0.35);
+                border-radius: 4px;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 0px;
+                    alignment: end;
+                    for line in root.log : Text {
+                        text: line;
+                        font-family: "Consolas";
+                        font-size: 10px;
+                        color: Theme.text2;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}

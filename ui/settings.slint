@@ -1,0 +1,417 @@
+import { Theme } from "theme.slint";
+
+component ResetBtn inherits Rectangle {
+    callback clicked();
+    width: 36px;
+    height: 32px;
+    border-radius: 4px;
+    background: ta.pressed ? Theme.surface2 : Theme.bg;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    Path {
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px;
+        height: 18px;
+        stroke: Theme.text2;
+        stroke-width: 2.2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        MoveTo { x: 4; y: 10; }
+        LineTo { x: 4; y: 4; }
+        MoveTo { x: 4; y: 10; }
+        LineTo { x: 10; y: 10; }
+        MoveTo { x: 4; y: 10; }
+        CubicTo { control-1-x: 5; control-1-y: 6.4; control-2-x: 8.1; control-2-y: 4; x: 12; y: 4; }
+        CubicTo { control-1-x: 16.4; control-1-y: 4; control-2-x: 20; control-2-y: 7.6; x: 20; y: 12; }
+        CubicTo { control-1-x: 20; control-1-y: 16.4; control-2-x: 16.4; control-2-y: 20; x: 12; y: 20; }
+        CubicTo { control-1-x: 8.5; control-1-y: 20; control-2-x: 5.5; control-2-y: 17.8; x: 4.4; y: 14.7; }
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component HelpBtn inherits Rectangle {
+    in property <string> tip;
+    in property <string> active-help: "";
+    callback ask(string, length, length);
+    width: 22px;
+    height: 22px;
+    border-radius: 11px;
+    property <bool> lit: help-popup.is-open;
+    background: help-ta.pressed || root.lit
+        ? Theme.accent-a.with-alpha(0.35)
+        : Theme.surface2;
+    border-width: 1px;
+    border-color: root.lit ? Theme.accent-a : Theme.border;
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: "?";
+        font-size: 11px;
+        font-weight: 800;
+        color: Theme.text2;
+    }
+
+    help-ta := TouchArea {
+        clicked => {
+            if (help-popup.is-open) {
+                help-popup.close();
+            } else {
+                help-popup.show();
+            }
+        }
+    }
+
+    help-popup := PopupWindow {
+        x: root.width + 6px;
+        y: -4px;
+        width: 300px;
+        height: help-col.preferred-height;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            border-radius: 8px;
+            background: Theme.surface2;
+            border-width: 1px;
+            border-color: Theme.accent-a.with-alpha(0.45);
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #000000cc;
+
+            help-col := VerticalLayout {
+                width: 100%;
+                padding: 12px;
+                spacing: 6px;
+                Text {
+                    width: 100%;
+                    text: root.tip;
+                    font-size: 13px;
+                    color: Theme.text1;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Tap outside to dismiss";
+                    font-size: 11px;
+                    color: Theme.text3;
+                }
+            }
+        }
+    }
+}
+
+export component MonitorSelect inherits Rectangle {
+    in property <string> label;
+    in property <string> help: "";
+    in property <string> active-help: "";
+    in property <[string]> options;
+    in-out property <int> current-index: 0;
+    callback ask-help(string, length, length);
+    callback dismiss-help();
+    property <string> current-label:
+        root.current-index >= 0 && root.current-index < root.options.length
+            ? root.options[root.current-index]
+            : "(none)";
+    height: 48px;
+    clip: false;
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        spacing: 8px;
+        alignment: center;
+        if root.help != "" : VerticalLayout {
+            width: 22px;
+            alignment: center;
+            HelpBtn {
+                tip: root.help;
+                active-help: root.active-help;
+                ask(t, ax, ay) => { root.ask-help(t, ax, ay); }
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 15px;
+            font-weight: 600;
+            color: Theme.text1;
+            vertical-alignment: center;
+            height: 100%;
+            horizontal-stretch: 1;
+        }
+        select-head := Rectangle {
+            horizontal-stretch: 2;
+            min-width: 160px;
+            height: 40px;
+            border-radius: 4px;
+            background: head-ta.pressed ? Theme.surface2 : Theme.bg;
+            border-width: 1px;
+            border-color: options-popup.is-open ? Theme.accent-a : Theme.border;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 8px;
+                alignment: center;
+                Text {
+                    text: root.current-label;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Theme.text1;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: options-popup.is-open ? "▲" : "▼";
+                    font-size: 10px;
+                    color: Theme.text3;
+                    vertical-alignment: center;
+                }
+            }
+            head-ta := TouchArea {
+                clicked => {
+                    root.dismiss-help();
+                    if options-popup.is-open {
+                        options-popup.close();
+                    } else if root.options.length > 0 {
+                        options-popup.show();
+                    }
+                }
+            }
+
+            options-popup := PopupWindow {
+                x: 0;
+                y: select-head.height + 4px;
+                width: select-head.width;
+                height: min(root.options.length, 6) * 40px + 2px;
+                close-policy: close-on-click-outside;
+
+                Rectangle {
+                    border-radius: 4px;
+                    background: Theme.bg;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+                    drop-shadow-blur: 14px;
+                    drop-shadow-color: #000000aa;
+                    Flickable {
+                        x: 1px;
+                        y: 1px;
+                        width: parent.width - 2px;
+                        height: parent.height - 2px;
+                        viewport-width: self.width;
+                        viewport-height: root.options.length * 40px;
+                        VerticalLayout {
+                            for opt[i] in root.options : Rectangle {
+                                height: 40px;
+                                width: 100%;
+                                background: i == root.current-index
+                                    ? Theme.accent-a.with-alpha(0.25)
+                                    : (row-ta.has-hover ? Theme.surface2 : transparent);
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: 100%;
+                                    text: opt;
+                                    font-size: 13px;
+                                    font-weight: i == root.current-index ? 700 : 500;
+                                    color: i == root.current-index ? Theme.accent-a : Theme.text1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                row-ta := TouchArea {
+                                    clicked => {
+                                        root.dismiss-help();
+                                        root.current-index = i;
+                                        options-popup.close();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component ToggleTile inherits Rectangle {
+    in property <string> label;
+    in property <string> help: "";
+    in property <string> active-help: "";
+    in-out property <bool> checked;
+    callback ask-help(string, length, length);
+    callback dismiss-help();
+    min-height: 64px;
+    horizontal-stretch: 1;
+    border-radius: 6px;
+    background: tile-ta.pressed
+        ? (root.checked ? Theme.accent-a.with-alpha(0.28) : Theme.surface2)
+        : (root.checked ? Theme.accent-a.with-alpha(0.16) : Theme.bg);
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent-a : Theme.border;
+
+    tile-ta := TouchArea {
+        clicked => {
+            root.dismiss-help();
+            root.checked = !root.checked;
+        }
+    }
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+
+        HorizontalLayout {
+            spacing: 4px;
+            alignment: center;
+            if root.help != "" : VerticalLayout {
+                width: 22px;
+                alignment: center;
+                HelpBtn {
+                    tip: root.help;
+                    active-help: root.active-help;
+                    ask(t, ax, ay) => { root.ask-help(t, ax, ay); }
+                }
+            }
+            Text {
+                text: root.label;
+                font-size: 12px;
+                font-weight: 700;
+                color: Theme.text1;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+            }
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            text: root.checked ? "ON" : "OFF";
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: 1px;
+            color: root.checked ? Theme.accent-a : Theme.text3;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component SliderRow inherits Rectangle {
+    in property <string> label;
+    in property <string> help: "";
+    in property <string> active-help: "";
+    in-out property <float> value;
+    in property <float> min-v: 0.0;
+    in property <float> max-v: 1.0;
+    in property <float> default-value: 0.0;
+    in property <string> display;
+    callback ask-help(string, length, length);
+    callback dismiss-help();
+    height: 74px;
+    property <float> norm: clamp(
+        (root.value - root.min-v) / max(0.0001, root.max-v - root.min-v),
+        0.0, 1.0);
+
+    function set-norm(n: float) {
+        root.value = root.min-v + clamp(n, 0.0, 1.0) * (root.max-v - root.min-v);
+    }
+
+    VerticalLayout {
+        spacing: 6px;
+        padding-left: 4px;
+        padding-right: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            height: 32px;
+            alignment: center;
+            if root.help != "" : VerticalLayout {
+                width: 22px;
+                alignment: center;
+                HelpBtn {
+                    tip: root.help;
+                    active-help: root.active-help;
+                    ask(t, ax, ay) => { root.ask-help(t, ax, ay); }
+                }
+            }
+            Text {
+                text: root.label;
+                font-size: 13px;
+                font-weight: 700;
+                color: Theme.text2;
+                vertical-alignment: center;
+                height: 100%;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.display;
+                font-size: 13px;
+                font-weight: 700;
+                color: Theme.text1;
+                vertical-alignment: center;
+                height: 100%;
+                min-width: 52px;
+                horizontal-alignment: right;
+            }
+            ResetBtn {
+                clicked => {
+                    root.dismiss-help();
+                    root.value = root.default-value;
+                }
+            }
+        }
+        track-host := Rectangle {
+            height: 36px;
+            width: 100%;
+            property <length> pad: 16px;
+            property <length> travel: max(1px, self.width - 2 * self.pad);
+            Rectangle {
+                x: track-host.pad;
+                y: (parent.height - 12px) / 2;
+                width: track-host.travel;
+                height: 12px;
+                border-radius: 6px;
+                background: Theme.surface2;
+                clip: true;
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: parent.width * root.norm;
+                    height: 100%;
+                    background: Theme.accent-a;
+                }
+            }
+            Rectangle {
+                x: track-host.pad + track-host.travel * root.norm - self.width / 2;
+                y: (parent.height - self.height) / 2;
+                width: 28px;
+                height: 28px;
+                border-radius: 14px;
+                background: Theme.text1;
+                drop-shadow-blur: 5px;
+                drop-shadow-color: #000000aa;
+            }
+            TouchArea {
+                moved => {
+                    root.set-norm((self.mouse-x - track-host.pad) / track-host.travel);
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.dismiss-help();
+                        root.set-norm((self.mouse-x - track-host.pad) / track-host.travel);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,15 @@
+/target/
+/PChordPad.exe
+*.pdb
+pchordpad.json
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+.idea/
+.vscode/
+.vs/
+*.user
+.env
+.env.*
+*.log

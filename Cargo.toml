@@ -1,0 +1,46 @@
+[package]
+name = "pchordpad"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+publish = false
+description = "PChord touch controller"
+readme = "README.md"
+keywords = ["spice2x", "pchord", "touch", "arcade"]
+categories = ["multimedia"]
+build = "build.rs"
+
+[dependencies]
+slint = { version = "1", default-features = false, features = [
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Input_Touch",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build = "1"
+winresource = "0.1"
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+debug = false

@@ -138,15 +138,24 @@ impl Runtime {
     pub fn start_pin_watch(&self, w: &PChordWindow) -> slint::Timer {
         let weak = w.as_weak();
         let windowed = self.windowed.clone();
+        let bridge = self.bridge.clone();
         let t = slint::Timer::default();
         t.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(1500),
             move || {
                 let Some(w) = weak.upgrade() else { return };
-                if !windowed.get() {
-                    Self::repin_if_needed(&w);
+                if windowed.get() {
+                    bridge.set_pinned(None);
+                    return;
                 }
+                bridge.set_pinned(Self::pad_mon(&w).map(|m| touchbridge::PinRect {
+                    left: m.left,
+                    top: m.top,
+                    width: m.width.max(1),
+                    height: m.height.max(1),
+                }));
+                Self::repin_if_needed(&w);
             },
         );
         t
@@ -208,8 +217,44 @@ impl Runtime {
         self.bind_keys(w);
         self.bind_analog(w);
         self.bind_mouse_key(w);
+        self.bind_mark(w);
         self.bind_quit(w);
         self.bind_settings(w);
+    }
+
+    fn bind_mark(&self, w: &PChordWindow) {
+        let weak = w.as_weak();
+        let diag = self.diag.clone();
+        let api = self.api.clone();
+        let bridge = self.bridge.clone();
+        let log_model = self.log.clone();
+
+        w.on_mark_stall(move || {
+            let touch = bridge.stats();
+            let api_snap = match api.borrow().as_ref() {
+                Some(c) => c.debug_snapshot(),
+                None => "spiceapi client: none".into(),
+            };
+            let detail = format!(
+                "touch live={} peak={} dropped={} adopted={} revived={} vetoed_moves={}\n{api_snap}",
+                touch.live,
+                touch.peak,
+                touch.dropped,
+                touch.adopted,
+                touch.revived,
+                bridge.vetoed_moves()
+            );
+            let banner = diag.borrow_mut().mark_stall(&detail);
+            let Some(w) = weak.upgrade() else { return };
+            let d = diag.borrow();
+            log_model.set_vec(
+                d.log_lines()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            );
+            w.set_latency(d.latency_summary().into());
+            let _ = banner;
+        });
     }
 
     fn bind_nav(&self, w: &PChordWindow) {
@@ -391,11 +436,20 @@ impl Runtime {
         let installed = std::cell::Cell::new(false);
         let nav_generation = std::cell::Cell::new(0u64);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let last_tick = std::cell::Cell::new(std::time::Instant::now());
+        const TICK_LATE: std::time::Duration = std::time::Duration::from_millis(250);
         let t = slint::Timer::default();
         t.start(
             slint::TimerMode::Repeated,
-            std::time::Duration::from_millis(33),
+            std::time::Duration::from_millis(16),
             move || {
+                let late = last_tick.replace(std::time::Instant::now()).elapsed();
+                if late > TICK_LATE {
+                    log::warn!(
+                        "UI thread stalled {:.0} ms — no touch delivered in that window",
+                        late.as_secs_f32() * 1000.0
+                    );
+                }
                 let Some(w) = weak.upgrade() else { return };
                 if !installed.get() {
                     if touchbridge::install(&bridge, w.as_weak()) {

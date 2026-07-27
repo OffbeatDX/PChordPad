@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-const LOG_LINES: usize = 5;
+const LOG_LINES: usize = 12;
+const LATENCY_SAMPLES: usize = 256;
 
 pub struct Diagnostics {
     start: Instant,
@@ -10,6 +11,8 @@ pub struct Diagnostics {
     digital_events: u64,
     analog_events: u64,
     latency: Vec<f32>,
+    latency_seen: u64,
+    mark_count: u64,
 }
 
 impl Diagnostics {
@@ -20,7 +23,9 @@ impl Diagnostics {
             log: VecDeque::with_capacity(LOG_LINES + 1),
             digital_events: 0,
             analog_events: 0,
-            latency: Vec::new(),
+            latency: Vec::with_capacity(LATENCY_SAMPLES),
+            latency_seen: 0,
+            mark_count: 0,
         }
     }
 
@@ -58,7 +63,14 @@ impl Diagnostics {
     }
 
     pub fn on_latency(&mut self, ms: f32) {
+        if self.latency.len() == LATENCY_SAMPLES {
+            self.latency.remove(0);
+        }
         self.latency.push(ms);
+        self.latency_seen += 1;
+        if ms >= 200.0 {
+            log::warn!("{}  touch→key latency {:.1} ms", self.stamp(), ms);
+        }
     }
 
     pub fn latency_summary(&self) -> String {
@@ -69,10 +81,26 @@ impl Diagnostics {
         s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p50 = s[s.len() / 2];
         let max = s[s.len() - 1];
-        format!("p50 {p50:.1} ms · max {max:.1} ms · n={}", s.len())
+        format!(
+            "p50 {p50:.1} ms · max {max:.1} ms · n={} of {}",
+            s.len(),
+            self.latency_seen
+        )
     }
 
-    fn stamp(&self) -> String {
+    pub fn mark_stall(&mut self, detail: &str) -> String {
+        self.mark_count += 1;
+        let n = self.mark_count;
+        let stamp = self.stamp();
+        let banner = format!("{stamp}  ★★★ STALL MARK #{n} ★★★");
+        log::error!("========== STALL MARK #{n} @ {stamp} ==========");
+        log::error!("{detail}");
+        log::error!("========== END STALL MARK #{n} ==========");
+        self.push(banner.clone());
+        banner
+    }
+
+    pub fn stamp(&self) -> String {
         let ms = self.start.elapsed().as_millis();
         format!(
             "{:02}:{:02}.{:03}",
@@ -141,5 +169,14 @@ mod tests {
         st.on_latency(4.0);
         st.on_latency(9.0);
         assert!(st.latency_summary().contains("n=2"));
+    }
+
+    #[test]
+    fn mark_stall_shows_up_in_the_on_screen_log() {
+        let mut st = Diagnostics::new();
+        let banner = st.mark_stall("spiceapi snapshot test");
+        assert!(banner.contains("STALL MARK #1"));
+        assert_eq!(st.log_lines().count(), 1);
+        assert!(st.log_lines().next().unwrap().contains("STALL MARK #1"));
     }
 }

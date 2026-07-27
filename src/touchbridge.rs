@@ -21,6 +21,8 @@ pub struct Stats {
     pub live: usize,
     pub peak: usize,
     pub dropped: u64,
+    pub adopted: u64,
+    pub revived: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -112,6 +114,16 @@ struct State {
     contact_key: HashMap<u32, Option<usize>>,
     held: [bool; KEY_COUNT],
     on_key: Option<KeyListener>,
+    pinned: Option<PinRect>,
+    vetoed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinRect {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl Default for State {
@@ -131,6 +143,8 @@ impl Default for State {
             contact_key: HashMap::new(),
             held: [false; KEY_COUNT],
             on_key: None,
+            pinned: None,
+            vetoed: 0,
         }
     }
 }
@@ -138,25 +152,14 @@ impl Default for State {
 impl State {
     fn classify(&mut self, id: u32, down: bool, up: bool, x: f32, y: f32) -> Option<Act> {
         if down {
-            self.contact_key.remove(&id);
+            self.contact_key.insert(id, None);
             if self.primary == Some(id) {
                 return Some(Act::Move(x, y));
             }
             if let Some(s) = self.slots.iter().position(|s| *s == Some(id)) {
                 return Some(Act::Slot(s, true, x, y));
             }
-            if self.primary.is_none() {
-                self.primary = Some(id);
-                self.recount();
-                return Some(Act::Down(x, y));
-            }
-            let Some(s) = self.slots.iter().position(Option::is_none) else {
-                self.stats.dropped += 1;
-                return None;
-            };
-            self.slots[s] = Some(id);
-            self.recount();
-            return Some(Act::Slot(s, true, x, y));
+            return self.adopt(id, x, y);
         }
         if up {
             if self.primary == Some(id) {
@@ -172,8 +175,33 @@ impl State {
         if self.primary == Some(id) {
             return Some(Act::Move(x, y));
         }
-        let s = self.slots.iter().position(|s| *s == Some(id))?;
+        if let Some(s) = self.slots.iter().position(|s| *s == Some(id)) {
+            return Some(Act::Slot(s, true, x, y));
+        }
+        self.stats.adopted += 1;
+        self.adopt(id, x, y)
+    }
+
+    fn adopt(&mut self, id: u32, x: f32, y: f32) -> Option<Act> {
+        if self.primary.is_none() {
+            self.primary = Some(id);
+            self.recount();
+            return Some(Act::Down(x, y));
+        }
+        let Some(s) = self.slots.iter().position(Option::is_none) else {
+            self.stats.dropped += 1;
+            return None;
+        };
+        self.slots[s] = Some(id);
+        self.recount();
         Some(Act::Slot(s, true, x, y))
+    }
+
+    #[cfg(windows)]
+    fn stamp_down(&mut self, x: f32, y: f32) {
+        if self.keys_enabled && self.key_geom.hit(x, y, None).is_some() {
+            self.last_down = Some(std::time::Instant::now());
+        }
     }
 
     fn recount(&mut self) {
@@ -186,8 +214,12 @@ impl State {
         if up || !self.keys_enabled {
             self.contact_key.remove(&id);
         } else {
+            let known = self.contact_key.contains_key(&id);
             let prev = self.contact_key.get(&id).copied().flatten();
             let next = self.key_geom.hit(x, y, prev);
+            if !known && next.is_some() {
+                self.stats.revived += 1;
+            }
             self.contact_key.insert(id, next);
         }
         if self.stats.live == 0 {
@@ -253,6 +285,14 @@ impl Bridge {
         self.lock().key_geom = geom;
     }
 
+    pub fn set_pinned(&self, rect: Option<PinRect>) {
+        self.lock().pinned = rect;
+    }
+
+    pub fn vetoed_moves(&self) -> u64 {
+        self.lock().vetoed
+    }
+
     pub fn set_keys_enabled(&self, on: bool) {
         let edges = {
             let mut st = self.lock();
@@ -294,10 +334,10 @@ impl Bridge {
 
     #[cfg(windows)]
     pub fn take_latency_ms(&self) -> Option<f32> {
-        self.lock()
-            .last_down
-            .take()
-            .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+        const STALE: std::time::Duration = std::time::Duration::from_millis(500);
+        let t = self.lock().last_down.take()?;
+        let elapsed = t.elapsed();
+        (elapsed < STALE).then_some(elapsed.as_secs_f32() * 1000.0)
     }
     #[cfg(not(windows))]
     pub fn take_latency_ms(&self) -> Option<f32> {
@@ -313,6 +353,28 @@ impl Bridge {
     fn is_mine(&self, hwnd: isize) -> bool {
         let h = self.lock().hwnd;
         h != 0 && h == hwnd
+    }
+
+    #[cfg(windows)]
+    fn hold_position(
+        &self,
+        moving: bool,
+        sizing: bool,
+        x: &mut i32,
+        y: &mut i32,
+        cx: &mut i32,
+        cy: &mut i32,
+    ) -> Option<u64> {
+        let mut st = self.lock();
+        let p = st.pinned?;
+        let drifting = (moving && (*x, *y) != (p.left, p.top))
+            || (sizing && (*cx, *cy) != (p.width, p.height));
+        if !drifting {
+            return None;
+        }
+        (*x, *y, *cx, *cy) = (p.left, p.top, p.width, p.height);
+        st.vetoed += 1;
+        Some(st.vetoed)
     }
 
     #[cfg(windows)]
@@ -421,6 +483,7 @@ mod win {
 
     const SUBCLASS_ID: usize = 0x5043_4831;
 
+    const WM_WINDOWPOSCHANGING: u32 = 0x0046;
     const WM_TOUCH: u32 = 0x0240;
     const WM_POINTERUPDATE: u32 = 0x0245;
     const WM_POINTERDOWN: u32 = 0x0246;
@@ -527,22 +590,23 @@ mod win {
 
         let id = (wparam & 0xffff) as u32;
 
-        if matches!(msg, WM_POINTERLEAVE | WM_POINTERUP) {
-            let mut info: POINTER_INFO = core::mem::zeroed();
-            if GetPointerInfo(id, &mut info) == 0 {
+        let releasing = matches!(msg, WM_POINTERUP | WM_POINTERLEAVE);
+
+        let mut info: POINTER_INFO = core::mem::zeroed();
+        if GetPointerInfo(id, &mut info) == 0
+            || (info.pointerType != PT_TOUCH && info.pointerType != PT_PEN)
+        {
+            if releasing {
                 release_lost(bridge, id);
                 return true;
             }
-        }
-
-        let mut info: POINTER_INFO = core::mem::zeroed();
-        if GetPointerInfo(id, &mut info) == 0 {
-            return false;
-        }
-        if info.pointerType != PT_TOUCH && info.pointerType != PT_PEN {
             return false;
         }
         let Some(w) = bridge.window() else {
+            if releasing {
+                release_lost(bridge, id);
+                return true;
+            }
             return false;
         };
         let scale = w.window().scale_factor().max(0.01);
@@ -565,7 +629,7 @@ mod win {
         let act = {
             let mut st = bridge.lock();
             if down {
-                st.last_down = Some(std::time::Instant::now());
+                st.stamp_down(x, y);
             }
             st.classify(id, down, up, x, y)
         };
@@ -634,7 +698,7 @@ mod win {
                 let down = ti.dwFlags & TOUCHEVENTF_DOWN != 0;
                 let up = ti.dwFlags & TOUCHEVENTF_UP != 0;
                 if down {
-                    st.last_down = Some(std::time::Instant::now());
+                    st.stamp_down(x, y);
                 }
                 if let Some(act) = st.classify(ti.dwID, down, up, x, y) {
                     acts.push((ti.dwID, act));
@@ -683,6 +747,32 @@ mod win {
 
         if (msg == WM_POINTERACTIVATE || msg == WM_MOUSEACTIVATE) && bridge.is_mine(hwnd as isize) {
             return MA_NOACTIVATE as LRESULT;
+        }
+
+        if msg == WM_WINDOWPOSCHANGING && bridge.is_mine(hwnd as isize) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
+            let wp = &mut *(lparam as *mut WINDOWPOS);
+            let moving = wp.flags & SWP_NOMOVE == 0;
+            let sizing = wp.flags & SWP_NOSIZE == 0;
+            if moving || sizing {
+                let attempted = (wp.x, wp.y, wp.cx, wp.cy);
+                let vetoed = bridge
+                    .hold_position(moving, sizing, &mut wp.x, &mut wp.y, &mut wp.cx, &mut wp.cy);
+                if let Some(n) = vetoed {
+                    wp.flags &= !(SWP_NOMOVE | SWP_NOSIZE);
+                    if n == 1 || n % 25 == 0 {
+                        log::warn!(
+                            "refused pad window move/resize to {},{} {}×{} (#{n}) — \
+                             something is trying to maximize or reposition the pad",
+                            attempted.0,
+                            attempted.1,
+                            attempted.2,
+                            attempted.3
+                        );
+                    }
+                }
+            }
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
 
         if msg == WM_POINTERCAPTURECHANGED && bridge.is_mine(hwnd as isize) {
@@ -895,6 +985,112 @@ mod tests {
         st.stats.live = 0;
         let edges = st.track_key(1, 45.0, 150.0, true);
         assert_eq!(edges, vec![(0, false)]);
+    }
+
+    #[test]
+    fn a_contact_that_lost_its_down_is_adopted_on_the_next_move() {
+        let mut st = State {
+            key_geom: geom(),
+            ..State::default()
+        };
+        assert_eq!(
+            moved(&mut st, 42, 45.0, 150.0),
+            Some(Act::Down(45.0, 150.0))
+        );
+        assert_eq!(st.primary, Some(42));
+        assert_eq!(st.stats.adopted, 1);
+        assert_eq!(st.track_key(42, 45.0, 150.0, false), vec![(0, true)]);
+    }
+
+    #[test]
+    fn adoption_uses_a_slot_when_the_primary_is_taken() {
+        let mut st = State::default();
+        down(&mut st, 1, 0.0, 0.0);
+        assert_eq!(
+            moved(&mut st, 77, 5.0, 6.0),
+            Some(Act::Slot(0, true, 5.0, 6.0))
+        );
+        assert_eq!(st.slots[0], Some(77));
+        assert_eq!(st.stats.adopted, 1);
+        assert_eq!(st.stats.live, 2);
+    }
+
+    #[test]
+    fn a_genuine_new_contact_is_not_counted_as_adopted_or_revived() {
+        let mut st = State {
+            key_geom: geom(),
+            ..State::default()
+        };
+        down(&mut st, 1, 45.0, 150.0);
+        st.track_key(1, 45.0, 150.0, false);
+        assert_eq!(st.stats.adopted, 0);
+        assert_eq!(st.stats.revived, 0, "a first press is not a revival");
+    }
+
+    #[test]
+    fn a_contact_whose_key_mapping_was_wiped_is_counted_as_revived() {
+        let mut st = State {
+            key_geom: geom(),
+            ..State::default()
+        };
+        down(&mut st, 1, 45.0, 150.0);
+        st.track_key(1, 45.0, 150.0, false);
+        st.clear_all_keys();
+        assert_eq!(st.track_key(1, 45.0, 150.0, false), vec![(0, true)]);
+        assert_eq!(st.stats.revived, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pinned_window_refuses_the_maximize_geometry() {
+        let b = Bridge::create();
+        let pin = PinRect {
+            left: 0,
+            top: 1440,
+            width: 1920,
+            height: 1080,
+        };
+        b.set_pinned(Some(pin));
+
+        let (mut x, mut y, mut cx, mut cy) = (-8, 1432, 1936, 1096);
+        assert_eq!(
+            b.hold_position(true, true, &mut x, &mut y, &mut cx, &mut cy),
+            Some(1)
+        );
+        assert_eq!((x, y, cx, cy), (0, 1440, 1920, 1080));
+        assert_eq!(b.vetoed_moves(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn holding_position_ignores_fields_windows_will_not_read() {
+        let b = Bridge::create();
+        b.set_pinned(Some(PinRect {
+            left: 0,
+            top: 1440,
+            width: 1920,
+            height: 1080,
+        }));
+
+        let (mut x, mut y, mut cx, mut cy) = (0, 1440, 12345, 6789);
+        assert_eq!(
+            b.hold_position(true, false, &mut x, &mut y, &mut cx, &mut cy),
+            None
+        );
+        assert_eq!(b.vetoed_moves(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windowed_mode_leaves_the_window_alone() {
+        let b = Bridge::create();
+        b.set_pinned(None);
+        let (mut x, mut y, mut cx, mut cy) = (100, 200, 1280, 720);
+        assert_eq!(
+            b.hold_position(true, true, &mut x, &mut y, &mut cx, &mut cy),
+            None
+        );
+        assert_eq!((x, y, cx, cy), (100, 200, 1280, 720));
     }
 
     #[test]

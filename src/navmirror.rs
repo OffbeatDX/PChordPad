@@ -135,6 +135,8 @@ impl Drop for NavMirror {
     }
 }
 
+const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
+
 fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
     loop {
         let (target, epoch) = {
@@ -164,7 +166,7 @@ fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
             Ok(mut next) => {
                 next.generation = generation;
                 next.capture_ms = elapsed.as_secs_f32() * 1000.0;
-                if elapsed > std::time::Duration::from_millis(33) {
+                if elapsed > FRAME_BUDGET {
                     log::warn!("nav capture took {:.1} ms", next.capture_ms);
                 }
                 *frame = next;
@@ -181,9 +183,13 @@ fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
         if state.stop {
             return;
         }
+        let wait = FRAME_BUDGET.saturating_sub(elapsed);
+        if wait.is_zero() {
+            continue;
+        }
         let _ = shared
             .wake
-            .wait_timeout(state, std::time::Duration::from_millis(33))
+            .wait_timeout(state, wait)
             .unwrap_or_else(|e| e.into_inner());
     }
 }

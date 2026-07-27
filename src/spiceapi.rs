@@ -1,10 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 pub const DEFAULT_PORT: u16 = 1337;
+
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+const SLOW_RTT_MS: f32 = 50.0;
+const RECENT_CAP: usize = 48;
 
 fn to_spice_raw(v: f32) -> f32 {
     (v * 0.5 + 0.5).clamp(0.0, 1.0)
@@ -17,11 +23,34 @@ struct Pending {
     stop: bool,
 }
 
+#[derive(Default)]
+struct IoStats {
+    req_ok: u64,
+    req_fail: u64,
+    slow_req: u64,
+    last_rtt_ms: f32,
+    max_rtt_ms: f32,
+    last_module: String,
+    in_flight_since: Option<Instant>,
+    in_flight_label: String,
+    recent: VecDeque<String>,
+}
+
+impl IoStats {
+    fn push_recent(&mut self, line: String) {
+        if self.recent.len() == RECENT_CAP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(line);
+    }
+}
+
 struct Shared {
     pending: Mutex<Pending>,
     cv: Condvar,
     connected: AtomicBool,
     status: Mutex<String>,
+    stats: Mutex<IoStats>,
 }
 
 pub struct Client {
@@ -37,6 +66,7 @@ impl Client {
             cv: Condvar::new(),
             connected: AtomicBool::new(false),
             status: Mutex::new(format!("connecting to 127.0.0.1:{port}")),
+            stats: Mutex::new(IoStats::default()),
         });
         let worker = {
             let shared_for_thread = shared.clone();
@@ -70,8 +100,15 @@ impl Client {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         p.buttons.push((name.to_string(), down));
+        let q = p.buttons.len();
+        let connected = self.shared.connected.load(Ordering::Relaxed);
         drop(p);
         self.shared.cv.notify_one();
+        if !connected && (q == 1 || q == 10 || q == 25 || q == 50) {
+            log::warn!("spiceapi enqueue while disconnected: {name} down={down} q={q}");
+        } else if q == 20 || q == 50 || q == 100 {
+            log::warn!("spiceapi button backlog q={q}");
+        }
     }
 
     pub fn faders(&self, left: f32, right: f32) {
@@ -95,6 +132,48 @@ impl Client {
 
     pub fn connected(&self) -> bool {
         self.shared.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn debug_snapshot(&self) -> String {
+        let connected = self.connected();
+        let status = self.status();
+        let (q_btn, q_analog, stop) = {
+            let p = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (p.buttons.len(), p.analogs.is_some(), p.stop)
+        };
+        let st = self.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let in_flight = match st.in_flight_since {
+            Some(t) => format!(
+                "{} for {:.0}ms",
+                st.in_flight_label,
+                t.elapsed().as_secs_f32() * 1000.0
+            ),
+            None => "idle".into(),
+        };
+        let recent: Vec<&str> = st.recent.iter().map(|s| s.as_str()).collect();
+        format!(
+            "spiceapi snapshot port={} connected={} status={:?} q_buttons={} q_analogs={} stop={} \
+             req_ok={} req_fail={} slow>={SLOW_RTT_MS}ms={} last_rtt={:.1}ms max_rtt={:.1}ms \
+             last_module={} in_flight=[{}] recent=[\n  {}\n]",
+            self.port,
+            connected,
+            status,
+            q_btn,
+            q_analog,
+            stop,
+            st.req_ok,
+            st.req_fail,
+            st.slow_req,
+            st.last_rtt_ms,
+            st.max_rtt_ms,
+            st.last_module,
+            in_flight,
+            recent.join("\n  ")
+        )
     }
 }
 
@@ -120,6 +199,16 @@ fn set_status(shared: &Shared, connected: bool, msg: impl Into<String>) {
     *shared.status.lock().unwrap_or_else(|e| e.into_inner()) = msg.into();
 }
 
+fn note_recent(shared: &Shared, line: impl Into<String>) {
+    let line = line.into();
+    log::info!("{line}");
+    shared
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_recent(line);
+}
+
 fn run(shared: Arc<Shared>, port: u16) {
     loop {
         if shared
@@ -133,11 +222,11 @@ fn run(shared: Arc<Shared>, port: u16) {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(sock) => {
                 let _ = sock.set_nodelay(true);
-                log::info!("spiceapi connected on port {port}");
+                note_recent(&shared, format!("spiceapi connected :{port}"));
                 set_status(&shared, true, format!("connected :{port}"));
                 let why = pump(&shared, sock);
                 set_status(&shared, false, format!("disconnected ({why})"));
-                log::warn!("spiceapi disconnected: {why}");
+                note_recent(&shared, format!("spiceapi disconnected: {why}"));
             }
             Err(e) => {
                 set_status(&shared, false, format!("no game on :{port}"));
@@ -150,7 +239,7 @@ fn run(shared: Arc<Shared>, port: u16) {
         }
         let (p, _) = shared
             .cv
-            .wait_timeout(p, std::time::Duration::from_millis(750))
+            .wait_timeout(p, RECONNECT_WAIT)
             .unwrap_or_else(|e| e.into_inner());
         if p.stop {
             return;
@@ -163,13 +252,13 @@ fn pump(shared: &Shared, sock: TcpStream) -> String {
         Ok(r) => r,
         Err(e) => return format!("try_clone: {e}"),
     };
-    let _ = reader_sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = reader_sock.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(reader_sock);
     let mut sock = sock;
     let mut id: u64 = 1;
 
     loop {
-        let (buttons, analogs, stop, more) = {
+        let (buttons, analogs, stop, more, q_left) = {
             let mut p = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
             while !p.stop && p.buttons.is_empty() && p.analogs.is_none() {
                 p = shared.cv.wait(p).unwrap_or_else(|e| e.into_inner());
@@ -177,11 +266,13 @@ fn pump(shared: &Shared, sock: TcpStream) -> String {
             let buttons = take_button_batch(&mut p);
             let analogs = p.analogs.take();
             let more = !p.buttons.is_empty();
-            (buttons, analogs, p.stop, more)
+            let q_left = p.buttons.len() + usize::from(p.analogs.is_some());
+            (buttons, analogs, p.stop, more, q_left)
         };
 
         if stop {
             let _ = request(
+                shared,
                 &mut sock,
                 &mut reader,
                 &mut id,
@@ -190,6 +281,7 @@ fn pump(shared: &Shared, sock: TcpStream) -> String {
                 vec![],
             );
             let _ = request(
+                shared,
                 &mut sock,
                 &mut reader,
                 &mut id,
@@ -201,12 +293,24 @@ fn pump(shared: &Shared, sock: TcpStream) -> String {
         }
 
         if !buttons.is_empty() {
+            let n = buttons.len();
             let params: Vec<serde_json::Value> = buttons
                 .iter()
-                .map(|(n, d)| serde_json::json!([n, d]))
+                .map(|(name, d)| serde_json::json!([name, d]))
                 .collect();
-            if let Err(e) = request(&mut sock, &mut reader, &mut id, "buttons", "write", params) {
+            if let Err(e) = request(
+                shared,
+                &mut sock,
+                &mut reader,
+                &mut id,
+                "buttons",
+                "write",
+                params,
+            ) {
                 return e;
+            }
+            if q_left > 0 {
+                log::info!("spiceapi buttons.write n={n} remaining_q={q_left}");
             }
         }
         if let Some((l, r)) = analogs {
@@ -214,7 +318,15 @@ fn pump(shared: &Shared, sock: TcpStream) -> String {
                 serde_json::json!(["Fader-L", to_spice_raw(l)]),
                 serde_json::json!(["Fader-R", to_spice_raw(r)]),
             ];
-            if let Err(e) = request(&mut sock, &mut reader, &mut id, "analogs", "write", params) {
+            if let Err(e) = request(
+                shared,
+                &mut sock,
+                &mut reader,
+                &mut id,
+                "analogs",
+                "write",
+                params,
+            ) {
                 return e;
             }
         }
@@ -237,6 +349,7 @@ fn take_button_batch(p: &mut Pending) -> Vec<(String, bool)> {
 }
 
 fn request(
+    shared: &Shared,
     sock: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
     id: &mut u64,
@@ -244,26 +357,104 @@ fn request(
     function: &str,
     params: Vec<serde_json::Value>,
 ) -> Result<(), String> {
+    let req_id = *id;
+    let label = format!("{module}.{function} id={req_id}");
+    {
+        let mut st = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight_since = Some(Instant::now());
+        st.in_flight_label = label.clone();
+        st.last_module = format!("{module}.{function}");
+    }
+
     let req = serde_json::json!({
-        "id": *id,
+        "id": req_id,
         "module": module,
         "function": function,
         "params": params,
     });
     *id += 1;
 
+    let t0 = Instant::now();
     let mut buf = serde_json::to_vec(&req).map_err(|e| format!("encode: {e}"))?;
     buf.push(0);
-    sock.write_all(&buf).map_err(|e| format!("write: {e}"))?;
+    if let Err(e) = sock.write_all(&buf) {
+        clear_in_flight(shared);
+        bump_fail(shared);
+        return Err(format!("write: {e}"));
+    }
 
     let mut resp = Vec::new();
-    match reader.read_until(0, &mut resp) {
-        Ok(0) => return Err("connection closed".into()),
-        Ok(_) => {}
-        Err(e) => return Err(format!("read: {e}")),
+    let read_result = reader.read_until(0, &mut resp);
+    let rtt_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    clear_in_flight(shared);
+
+    match read_result {
+        Ok(0) => {
+            bump_fail(shared);
+            note_recent(
+                shared,
+                format!("spiceapi {label} connection closed after {rtt_ms:.0}ms"),
+            );
+            Err("connection closed".into())
+        }
+        Ok(_) => {
+            record_rtt(shared, &label, rtt_ms, true);
+            report_errors(&resp, module, function);
+            Ok(())
+        }
+        Err(e) => {
+            bump_fail(shared);
+            let kind = if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock
+            {
+                "READ TIMEOUT"
+            } else {
+                "read error"
+            };
+            note_recent(
+                shared,
+                format!("spiceapi {label} {kind} after {rtt_ms:.0}ms: {e}"),
+            );
+            Err(format!("read: {e}"))
+        }
     }
-    report_errors(&resp, module, function);
-    Ok(())
+}
+
+fn clear_in_flight(shared: &Shared) {
+    let mut st = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+    st.in_flight_since = None;
+    st.in_flight_label.clear();
+}
+
+fn bump_fail(shared: &Shared) {
+    shared
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .req_fail += 1;
+}
+
+fn record_rtt(shared: &Shared, label: &str, rtt_ms: f32, ok: bool) {
+    let mut st = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        st.req_ok += 1;
+    } else {
+        st.req_fail += 1;
+    }
+    st.last_rtt_ms = rtt_ms;
+    if rtt_ms > st.max_rtt_ms {
+        st.max_rtt_ms = rtt_ms;
+    }
+    let slow = rtt_ms >= SLOW_RTT_MS;
+    if slow {
+        st.slow_req += 1;
+    }
+    let line = format!("spiceapi {label} rtt={rtt_ms:.1}ms");
+    st.push_recent(line.clone());
+    drop(st);
+    if slow {
+        log::warn!("{line}");
+    }
 }
 
 fn report_errors(resp: &[u8], module: &str, function: &str) {
@@ -389,6 +580,9 @@ mod tests {
             done_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("server should finish both requests");
+            let snap = client.debug_snapshot();
+            assert!(snap.contains("connected=true"), "{snap}");
+            assert!(snap.contains("req_ok="), "{snap}");
         }
 
         let msgs = server.join().expect("server thread");

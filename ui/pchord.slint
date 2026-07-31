@@ -1,5 +1,4 @@
 import { Theme } from "theme.slint";
-import { MultiTouch } from "multitouch.slint";
 
 component NoteKey inherits Rectangle {
     in property <int> index;
@@ -202,31 +201,14 @@ component FaderChevron inherits Rectangle {
     }
 }
 
-component SpringFader inherits Rectangle {
+component FaderView inherits Rectangle {
     in property <string> label;
     in property <color> accent: Theme.fader-l;
-    in property <bool> interactive: true;
-    in property <bool> mt-enabled: true;
-    in property <float> curve: 1.0;
-    in property <float> dead: 0.04;
-    in property <duration> tick: 16ms;
-    in property <float> decay: 0.7;
-    in property <float> snap: 0.005;
-    in property <bool> relative: true;
-    in property <length> rel-travel: 100px;
-    in property <length> speed-dead: 2.5px;
-    in property <float> dir-enter: 0.5;
-    in property <float> dir-leave: 0.35;
     in property <length> track-w: root.width * 0.55;
+    in property <float> value: 0.0;
+    in property <bool> grabbed: false;
     clip: false;
     background: transparent;
-
-    out property <float> value: root.grabbed
-        ? (root.relative ? root.rel-value : root.abs-value)
-        : root.settled;
-    out property <bool> grabbed: root.pri-on || root.mt-on;
-    out property <int> dir: 0;
-    callback moved(float);
 
     property <length> head-h: 34px;
     property <length> track-y: root.head-h;
@@ -244,87 +226,10 @@ component SpringFader inherits Rectangle {
     property <length> center-x: root.track-x + root.track-vis-w / 2;
     property <length> half: max(1px, (root.track-vis-w - root.handle-w) / 2);
 
-    property <length> mt-pos: MultiTouch.local-x(
-        root.absolute-position.x, root.absolute-position.y + root.track-y,
-        root.width, root.track-h);
-    property <bool> mt-on: root.interactive && root.mt-enabled && root.mt-pos >= 0px;
-    property <bool> pri-on: root.interactive && ta.pressed;
-    property <length> pos: root.mt-on ? root.mt-pos : ta.mouse-x;
-
-    property <float> raw-t: clamp((root.pos - root.center-x) / root.half, -1.0, 1.0);
-    property <float> mag: Math.abs(root.raw-t);
-    property <float> shaped: root.mag < root.dead
-        ? 0.0
-        : Math.pow((root.mag - root.dead) / (1.0 - root.dead), root.curve);
-    property <float> abs-value: root.raw-t < 0 ? -root.shaped : root.shaped;
-
-    property <float> rel-value: 0.0;
-    property <length> last-pos: 0px;
-    property <bool> has-last: false;
-    property <length> delta-px: 0px;
-    property <float> step: 0.0;
-
-    changed grabbed => {
-        if (root.grabbed) {
-            root.has-last = false;
-            if (root.relative) {
-                root.rel-value = root.settled;
-            }
-        } else {
-            root.settled = root.relative ? root.rel-value : root.abs-value;
-            root.has-last = false;
-        }
-    }
-
-    changed pos => {
-        if (!root.grabbed || !root.relative) {
-            return;
-        }
-        if (!root.has-last) {
-            root.last-pos = root.pos;
-            root.has-last = true;
-            return;
-        }
-        root.delta-px = root.pos - root.last-pos;
-        root.last-pos = root.pos;
-        if (Math.abs(root.delta-px / 1px) < root.speed-dead / 1px) {
-            return;
-        }
-        if (root.rel-value != 0.0
-            && ((root.delta-px > 0px && root.rel-value < 0.0)
-                || (root.delta-px < 0px && root.rel-value > 0.0))) {
-            root.rel-value = 0.0;
-        }
-        root.step = (root.delta-px / 1px) / max(1.0, root.rel-travel / 1px);
-        if (root.curve != 1.0 && root.step != 0.0) {
-            root.step = (root.step < 0.0 ? -1.0 : 1.0)
-                * Math.pow(Math.abs(root.step), root.curve);
-        }
-        root.rel-value = clamp(root.rel-value + root.step, -1.0, 1.0);
-    }
-
-    property <float> settled: 0.0;
-    changed value => {
-        if (root.grabbed) {
-            root.settled = root.value;
-        }
-        root.moved(root.value);
-        if (root.value >= root.dir-enter) {
-            root.dir = 1;
-        } else if (root.value <= -root.dir-enter) {
-            root.dir = -1;
-        } else if (Math.abs(root.value) < root.dir-leave) {
-            root.dir = 0;
-        }
-    }
-
-    Timer {
-        interval: root.tick;
-        running: !root.grabbed && root.settled != 0.0;
-        triggered => {
-            root.settled = Math.abs(root.settled) < root.snap ? 0.0 : root.settled * root.decay;
-        }
-    }
+    out property <length> zone-y: root.track-y;
+    out property <length> zone-h: root.track-h;
+    out property <length> zone-center-x: root.center-x;
+    out property <length> zone-half: root.half;
 
     Text {
         x: root.track-x;
@@ -400,12 +305,6 @@ component SpringFader inherits Rectangle {
         drop-shadow-blur: root.grabbed ? 14px : 6px;
         drop-shadow-color: root.accent.with-alpha(0.45);
     }
-
-    ta := TouchArea {
-        y: root.track-y;
-        height: root.track-h;
-        enabled: root.interactive;
-    }
 }
 
 export component FitSlider inherits Rectangle {
@@ -454,30 +353,21 @@ export component FitSlider inherits Rectangle {
 }
 
 export component PChordPanel inherits Rectangle {
-    in property <bool> interactive: true;
-    in property <bool> mt-enabled: true;
     in property <[bool]> key-held;
     in property <bool> light-keys: false;
 
-    in property <float> fader-curve: 1.0;
-    in property <float> fader-dead: 0.04;
-    in property <duration> fader-tick: 16ms;
-    in property <float> fader-decay: 0.7;
-    in property <bool> relative-faders: true;
-    in property <length> fader-rel-travel: 100px;
-    in property <length> fader-speed-dead: 2.5px;
+    in property <float> fader-l-value: 0.0;
+    in property <float> fader-r-value: 0.0;
+    in property <bool> grabbed-l: false;
+    in property <bool> grabbed-r: false;
+
+    in property <float> key-height: 0.66;
+    in property <float> fader-pos: 0.0;
 
     in property <float> min-fit: 0.4;
     in property <float> fit: 1.0;
     property <length> content-w: root.width * (root.min-fit + (1.0 - root.min-fit) * root.fit);
     property <length> content-x: (root.width - root.content-w) / 2;
-
-    out property <float> fader-l: fl.value;
-    out property <float> fader-r: fr.value;
-    out property <int> dir-l: fl.dir;
-    out property <int> dir-r: fr.dir;
-    out property <bool> grabbed-l: fl.grabbed;
-    out property <bool> grabbed-r: fr.grabbed;
 
     out property <float> key-geom-x: (root.content-x + root.margin) / 1px;
     out property <float> key-geom-y: root.row-y / 1px;
@@ -486,7 +376,18 @@ export component PChordPanel inherits Rectangle {
     out property <float> key-geom-key-w: root.key-w / 1px;
     out property <float> key-geom-gap: root.key-gap / 1px;
 
-    callback analog(string, float);
+    out property <float> fader-l-zone-x: fl.x / 1px;
+    out property <float> fader-l-zone-y: (fl.y + fl.zone-y) / 1px;
+    out property <float> fader-l-zone-w: fl.width / 1px;
+    out property <float> fader-l-zone-h: fl.zone-h / 1px;
+    out property <float> fader-l-center-x: (fl.x + fl.zone-center-x) / 1px;
+    out property <float> fader-l-half: fl.zone-half / 1px;
+    out property <float> fader-r-zone-x: fr.x / 1px;
+    out property <float> fader-r-zone-y: (fr.y + fr.zone-y) / 1px;
+    out property <float> fader-r-zone-w: fr.width / 1px;
+    out property <float> fader-r-zone-h: fr.zone-h / 1px;
+    out property <float> fader-r-center-x: (fr.x + fr.zone-center-x) / 1px;
+    out property <float> fader-r-half: fr.zone-half / 1px;
 
     property <length> margin: max(12px, root.content-w * 0.01);
     property <length> gap: max(8px, root.content-w * 0.006);
@@ -496,15 +397,18 @@ export component PChordPanel inherits Rectangle {
     property <length> key-gap: max(2px, root.content-w * 0.002);
     property <length> key-w: (root.content-w - 2 * root.margin - 11 * root.key-gap) / 12;
 
-    property <length> fader-h: root.body-h * 0.33;
+    property <length> row-h: clamp(root.key-height, 0.2, 0.9) * root.body-h;
+    property <length> row-y: root.body-y + root.body-h - root.row-h;
+    property <length> free-h: max(0px, root.row-y - root.body-y);
+
+    property <length> fader-h: min(root.body-h * 0.33, max(1px, root.free-h - root.gap));
+    property <length> fader-slack: max(0px, root.free-h - root.gap - root.fader-h);
+    property <length> fader-y: root.body-y + clamp(root.fader-pos, 0.0, 1.0) * root.fader-slack;
     property <length> fader-track-w: 4 * root.key-w + 3 * root.key-gap;
     property <length> fader-zone-gap: root.gap;
     property <length> fader-zone-w: (root.content-w - 2 * root.margin - root.fader-zone-gap) / 2;
     property <length> fader-l-x: root.content-x + root.margin;
     property <length> fader-r-x: root.fader-l-x + root.fader-zone-w + root.fader-zone-gap;
-
-    property <length> row-y: root.body-y + root.fader-h + root.gap;
-    property <length> row-h: max(1px, root.body-h - root.fader-h - root.gap);
 
     public pure function key-x(i: int) -> length {
         root.content-x + root.margin + i * (root.key-w + root.key-gap);
@@ -514,49 +418,33 @@ export component PChordPanel inherits Rectangle {
 
     Rectangle {
         x: root.content-x;
-        y: root.body-y - 4px;
+        y: root.fader-y - 4px;
         width: root.content-w;
         height: root.fader-h + 8px;
         background: #050506;
     }
 
-    fl := SpringFader {
+    fl := FaderView {
         x: root.fader-l-x;
-        y: root.body-y;
+        y: root.fader-y;
         width: root.fader-zone-w;
         height: root.fader-h;
         track-w: root.fader-track-w;
         label: "FADER-L";
         accent: Theme.fader-l;
-        interactive: root.interactive;
-        mt-enabled: root.mt-enabled;
-        curve: root.fader-curve;
-        dead: root.fader-dead;
-        tick: root.fader-tick;
-        decay: root.fader-decay;
-        relative: root.relative-faders;
-        rel-travel: root.fader-rel-travel;
-        speed-dead: root.fader-speed-dead;
-        moved(v) => { root.analog("Fader-L", v); }
+        value: root.fader-l-value;
+        grabbed: root.grabbed-l;
     }
-    fr := SpringFader {
+    fr := FaderView {
         x: root.fader-r-x;
-        y: root.body-y;
+        y: root.fader-y;
         width: root.fader-zone-w;
         height: root.fader-h;
         track-w: root.fader-track-w;
         label: "FADER-R";
         accent: Theme.fader-r;
-        interactive: root.interactive;
-        mt-enabled: root.mt-enabled;
-        curve: root.fader-curve;
-        dead: root.fader-dead;
-        tick: root.fader-tick;
-        decay: root.fader-decay;
-        relative: root.relative-faders;
-        rel-travel: root.fader-rel-travel;
-        speed-dead: root.fader-speed-dead;
-        moved(v) => { root.analog("Fader-R", v); }
+        value: root.fader-r-value;
+        grabbed: root.grabbed-r;
     }
 
     if root.light-keys : Rectangle {

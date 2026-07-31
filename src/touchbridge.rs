@@ -1,19 +1,27 @@
+use crate::faders::{FaderCfg, Faders, Zone, FADER_COUNT};
 use crate::PChordWindow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub const WINDOW_TITLE: &str = "PChordPad";
 
-pub const MT_SLOTS: usize = 9;
-
 pub const KEY_COUNT: usize = 12;
 
+pub const MAX_CONTACTS: usize = 16;
+
+pub const MOUSE_CONTACT: u32 = 0xFFFF_FFFE;
+
+pub const CONTACT_SILENT: std::time::Duration = std::time::Duration::from_millis(400);
+
+pub const TOUCH_SILENT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Act {
-    Down(f32, f32),
+pub enum CursorAction {
+    None,
+    Press(f32, f32),
     Move(f32, f32),
-    Up(f32, f32),
-    Slot(usize, bool, f32, f32),
+    Release(f32, f32),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -21,11 +29,9 @@ pub struct Stats {
     pub live: usize,
     pub peak: usize,
     pub dropped: u64,
-    pub adopted: u64,
-    pub revived: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct KeyGeom {
     pub x: f32,
     pub y: f32,
@@ -46,6 +52,10 @@ impl KeyGeom {
 
     fn center(&self, i: usize) -> f32 {
         self.x + i as f32 * self.pitch() + self.key_w * 0.5
+    }
+
+    fn in_band(&self, x: f32, y: f32) -> bool {
+        self.valid() && x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 
     pub fn hit(&self, x: f32, y: f32, prev: Option<usize>) -> Option<usize> {
@@ -95,6 +105,38 @@ impl UiKeyHandler {
     }
 }
 
+type AnalogListener = Arc<UiAnalogHandler>;
+
+struct UiAnalogHandler {
+    f: Box<dyn Fn(f32, f32)>,
+}
+
+unsafe impl Send for UiAnalogHandler {}
+unsafe impl Sync for UiAnalogHandler {}
+
+impl UiAnalogHandler {
+    fn new(f: impl Fn(f32, f32) + 'static) -> Arc<Self> {
+        Arc::new(UiAnalogHandler { f: Box::new(f) })
+    }
+    fn call(&self, l: f32, r: f32) {
+        (self.f)(l, r);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    x: f32,
+    y: f32,
+    seen: Instant,
+    key: Option<usize>,
+}
+
+struct Ingest {
+    key_edges: Vec<(usize, bool)>,
+    analog: Option<[f32; FADER_COUNT]>,
+    cursor: CursorAction,
+}
+
 pub struct Bridge {
     state: Mutex<State>,
 }
@@ -104,18 +146,30 @@ struct State {
     win: Option<slint::Weak<PChordWindow>>,
     install_thread: Option<std::thread::ThreadId>,
     thread_mismatch_logged: bool,
-    primary: Option<u32>,
-    slots: [Option<u32>; MT_SLOTS],
+    contacts: HashMap<u32, Contact>,
+    cursor: Option<u32>,
     stats: Stats,
-    #[cfg(windows)]
-    last_down: Option<std::time::Instant>,
     key_geom: KeyGeom,
     keys_enabled: bool,
-    contact_key: HashMap<u32, Option<usize>>,
     held: [bool; KEY_COUNT],
     on_key: Option<KeyListener>,
+    on_analog: Option<AnalogListener>,
+    faders: Faders,
+    last_analog: [f32; FADER_COUNT],
     pinned: Option<PinRect>,
     vetoed: u64,
+    minimized: bool,
+    route: Route,
+    expired: u64,
+    displays_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Route {
+    #[default]
+    Unknown,
+    Pointer,
+    Touch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,119 +187,131 @@ impl Default for State {
             win: None,
             install_thread: None,
             thread_mismatch_logged: false,
-            primary: None,
-            slots: [None; MT_SLOTS],
+            contacts: HashMap::new(),
+            cursor: None,
             stats: Stats::default(),
-            #[cfg(windows)]
-            last_down: None,
             key_geom: KeyGeom::default(),
             keys_enabled: true,
-            contact_key: HashMap::new(),
             held: [false; KEY_COUNT],
             on_key: None,
+            on_analog: None,
+            faders: Faders::new(),
+            last_analog: [0.0; FADER_COUNT],
             pinned: None,
             vetoed: 0,
+            minimized: false,
+            route: Route::Unknown,
+            expired: 0,
+            displays_changed: false,
         }
     }
 }
 
 impl State {
-    fn classify(&mut self, id: u32, down: bool, up: bool, x: f32, y: f32) -> Option<Act> {
-        if down {
-            self.contact_key.insert(id, None);
-            if self.primary == Some(id) {
-                return Some(Act::Move(x, y));
-            }
-            if let Some(s) = self.slots.iter().position(|s| *s == Some(id)) {
-                return Some(Act::Slot(s, true, x, y));
-            }
-            return self.adopt(id, x, y);
+    fn ingest(&mut self, id: u32, x: f32, y: f32, alive: bool) -> Ingest {
+        if alive {
+            self.ingest_alive(id, x, y)
+        } else {
+            self.ingest_gone(id, x, y)
         }
-        if up {
-            if self.primary == Some(id) {
-                self.primary = None;
-                self.recount();
-                return Some(Act::Up(x, y));
-            }
-            let s = self.slots.iter().position(|s| *s == Some(id))?;
-            self.slots[s] = None;
-            self.recount();
-            return Some(Act::Slot(s, false, x, y));
-        }
-        if self.primary == Some(id) {
-            return Some(Act::Move(x, y));
-        }
-        if let Some(s) = self.slots.iter().position(|s| *s == Some(id)) {
-            return Some(Act::Slot(s, true, x, y));
-        }
-        self.stats.adopted += 1;
-        self.adopt(id, x, y)
     }
 
-    fn adopt(&mut self, id: u32, x: f32, y: f32) -> Option<Act> {
-        if self.primary.is_none() {
-            self.primary = Some(id);
-            self.recount();
-            return Some(Act::Down(x, y));
-        }
-        let Some(s) = self.slots.iter().position(Option::is_none) else {
+    fn ingest_alive(&mut self, id: u32, x: f32, y: f32) -> Ingest {
+        let fresh = !self.contacts.contains_key(&id);
+        if fresh && self.contacts.len() >= MAX_CONTACTS {
             self.stats.dropped += 1;
-            return None;
+            return Ingest {
+                key_edges: Vec::new(),
+                analog: None,
+                cursor: CursorAction::None,
+            };
+        }
+
+        let analog_changed = self.keys_enabled && self.faders.offer(id, x, y);
+        let owns_fader = self.faders.owns(id);
+
+        let prev_key = self.contacts.get(&id).and_then(|c| c.key);
+        let key = if self.keys_enabled && !owns_fader {
+            self.key_geom.hit(x, y, prev_key)
+        } else {
+            None
         };
-        self.slots[s] = Some(id);
+        self.contacts.insert(
+            id,
+            Contact {
+                x,
+                y,
+                seen: Instant::now(),
+                key,
+            },
+        );
         self.recount();
-        Some(Act::Slot(s, true, x, y))
+
+        let key_edges = self.recompute_held();
+        let analog = analog_changed.then(|| self.faders.values());
+        let cursor = self.cursor_action(id, x, y, true, fresh);
+        Ingest {
+            key_edges,
+            analog,
+            cursor,
+        }
     }
 
-    #[cfg(windows)]
-    fn stamp_down(&mut self, x: f32, y: f32) {
-        if self.keys_enabled && self.key_geom.hit(x, y, None).is_some() {
-            self.last_down = Some(std::time::Instant::now());
+    fn ingest_gone(&mut self, id: u32, x: f32, y: f32) -> Ingest {
+        let last = self.contacts.remove(&id);
+        self.faders.release(id);
+        self.recount();
+        let key_edges = self.recompute_held();
+        let (rx, ry) = last.map(|c| (c.x, c.y)).unwrap_or((x, y));
+        let cursor = self.cursor_action(id, rx, ry, false, false);
+        Ingest {
+            key_edges,
+            analog: None,
+            cursor,
         }
+    }
+
+    fn cursor_action(&mut self, id: u32, x: f32, y: f32, alive: bool, fresh: bool) -> CursorAction {
+        if id == MOUSE_CONTACT {
+            return CursorAction::None;
+        }
+        if alive {
+            if self.cursor == Some(id) {
+                return CursorAction::Move(x, y);
+            }
+            if fresh && self.cursor.is_none() && self.is_chrome_point(x, y) {
+                self.cursor = Some(id);
+                return CursorAction::Press(x, y);
+            }
+            CursorAction::None
+        } else if self.cursor == Some(id) {
+            self.cursor = None;
+            CursorAction::Release(x, y)
+        } else {
+            CursorAction::None
+        }
+    }
+
+    fn is_chrome_point(&self, x: f32, y: f32) -> bool {
+        if !self.keys_enabled {
+            return true;
+        }
+        !(self.faders.zone_hit(x, y) || self.key_geom.in_band(x, y))
     }
 
     fn recount(&mut self) {
-        self.stats.live =
-            usize::from(self.primary.is_some()) + self.slots.iter().filter(|s| s.is_some()).count();
+        self.stats.live = self.contacts.len();
         self.stats.peak = self.stats.peak.max(self.stats.live);
-    }
-
-    fn track_key(&mut self, id: u32, x: f32, y: f32, up: bool) -> Vec<(usize, bool)> {
-        if up || !self.keys_enabled {
-            self.contact_key.remove(&id);
-        } else {
-            let known = self.contact_key.contains_key(&id);
-            let prev = self.contact_key.get(&id).copied().flatten();
-            let next = self.key_geom.hit(x, y, prev);
-            if !known && next.is_some() {
-                self.stats.revived += 1;
-            }
-            self.contact_key.insert(id, next);
-        }
-        if self.stats.live == 0 {
-            self.contact_key.clear();
-        }
-        self.recompute_held()
-    }
-
-    fn clear_all_keys(&mut self) -> Vec<(usize, bool)> {
-        self.contact_key.clear();
-        self.recompute_held()
-    }
-
-    fn reset_contacts(&mut self) -> Vec<(usize, bool)> {
-        self.primary = None;
-        self.slots.fill(None);
-        self.recount();
-        self.clear_all_keys()
     }
 
     fn recompute_held(&mut self) -> Vec<(usize, bool)> {
         let mut next = [false; KEY_COUNT];
         if self.keys_enabled {
-            for k in self.contact_key.values().flatten() {
-                if *k < KEY_COUNT {
-                    next[*k] = true;
+            for c in self.contacts.values() {
+                if let Some(k) = c.key {
+                    if k < KEY_COUNT {
+                        next[k] = true;
+                    }
                 }
             }
         }
@@ -257,6 +323,28 @@ impl State {
             }
         }
         edges
+    }
+
+    fn reset_contacts(&mut self) -> Vec<(usize, bool)> {
+        self.contacts.clear();
+        self.faders.release_all();
+        self.cursor = None;
+        self.recount();
+        self.recompute_held()
+    }
+
+    fn quiet_contacts(&self, silent: std::time::Duration) -> Vec<u32> {
+        self.contacts
+            .iter()
+            .filter(|(_, c)| c.seen.elapsed() >= silent)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn restamp(&mut self, id: u32) {
+        if let Some(c) = self.contacts.get_mut(&id) {
+            c.seen = Instant::now();
+        }
     }
 }
 
@@ -281,27 +369,138 @@ impl Bridge {
         self.lock().on_key = Some(UiKeyHandler::new(f));
     }
 
+    pub fn set_analog_listener(&self, f: impl Fn(f32, f32) + 'static) {
+        self.lock().on_analog = Some(UiAnalogHandler::new(f));
+    }
+
     pub fn set_key_geom(&self, geom: KeyGeom) {
         self.lock().key_geom = geom;
+    }
+
+    pub fn set_fader_geom(&self, zones: [Zone; FADER_COUNT]) {
+        self.lock().faders.set_zones(zones);
+    }
+
+    pub fn set_fader_cfg(&self, cfg: FaderCfg) {
+        self.lock().faders.set_cfg(cfg);
+    }
+
+    pub fn fader_snapshot(&self) -> ([f32; FADER_COUNT], [bool; FADER_COUNT], [i32; FADER_COUNT]) {
+        let st = self.lock();
+        (st.faders.values(), st.faders.grabbed(), st.faders.dirs())
+    }
+
+    pub fn tick_faders(&self) {
+        let vals = {
+            let mut st = self.lock();
+            st.faders.decay_step().then(|| st.faders.values())
+        };
+        if let Some(v) = vals {
+            self.emit_analog(v);
+        }
     }
 
     pub fn set_pinned(&self, rect: Option<PinRect>) {
         self.lock().pinned = rect;
     }
 
+    pub fn take_display_change(&self) -> bool {
+        std::mem::take(&mut self.lock().displays_changed)
+    }
+
     pub fn vetoed_moves(&self) -> u64 {
         self.lock().vetoed
+    }
+
+    #[cfg(windows)]
+    pub fn restore_if_minimized(&self) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsIconic, ShowWindow, SW_SHOWNOACTIVATE,
+        };
+        let hwnd = self.lock().hwnd;
+        if hwnd == 0 {
+            return false;
+        }
+        let iconic = unsafe { IsIconic(hwnd as _) != 0 };
+        let (announce, edges) = {
+            let mut st = self.lock();
+            let first = iconic && !st.minimized;
+            st.minimized = iconic;
+            let edges = if first {
+                st.reset_contacts()
+            } else {
+                Vec::new()
+            };
+            (first, edges)
+        };
+        self.emit_edges(edges);
+        if !iconic {
+            return false;
+        }
+        if announce {
+            log::warn!("pad window was minimized — restoring it without stealing focus");
+        }
+        unsafe { ShowWindow(hwnd as _, SW_SHOWNOACTIVATE) };
+        true
+    }
+
+    #[cfg(not(windows))]
+    pub fn restore_if_minimized(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    pub fn expire_lost_contacts(&self) {
+        let (route, quiet) = {
+            let st = self.lock();
+            if st.contacts.is_empty() {
+                return;
+            }
+            let silent = match st.route {
+                Route::Pointer => CONTACT_SILENT,
+                Route::Touch => TOUCH_SILENT,
+                Route::Unknown => return,
+            };
+            (st.route, st.quiet_contacts(silent))
+        };
+        for id in quiet {
+            if route == Route::Pointer && win::pointer_still_down(id) {
+                self.lock().restamp(id);
+                continue;
+            }
+            let n = {
+                let mut st = self.lock();
+                st.expired += 1;
+                st.expired
+            };
+            log::warn!(
+                "contact {id} vanished without an UP (#{n}, {route:?}) — releasing it so its key cannot stick"
+            );
+            self.release_contact(id, route);
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn expire_lost_contacts(&self) {}
+
+    pub fn expired_contacts(&self) -> u64 {
+        self.lock().expired
     }
 
     pub fn set_keys_enabled(&self, on: bool) {
         let edges = {
             let mut st = self.lock();
+            let was = st.keys_enabled;
             st.keys_enabled = on;
             if !on {
-                st.clear_all_keys()
-            } else {
-                Vec::new()
+                if was {
+                    st.faders.release_all();
+                }
+                for c in st.contacts.values_mut() {
+                    c.key = None;
+                }
             }
+            st.recompute_held()
         };
         self.emit_edges(edges);
     }
@@ -310,14 +509,29 @@ impl Bridge {
         self.lock().keys_enabled
     }
 
-    pub const MOUSE_CONTACT: u32 = 0xFFFF_FFFE;
-
     pub fn track_mouse(&self, x: f32, y: f32, up: bool) {
-        let edges = {
+        self.process(MOUSE_CONTACT, x, y, !up, Route::Pointer);
+    }
+
+    fn process(&self, id: u32, x: f32, y: f32, alive: bool, route: Route) -> CursorAction {
+        let ing = {
             let mut st = self.lock();
-            st.track_key(Self::MOUSE_CONTACT, x, y, up)
+            st.route = route;
+            st.ingest(id, x, y, alive)
         };
-        self.emit_edges(edges);
+        self.emit_edges(ing.key_edges);
+        if let Some(v) = ing.analog {
+            self.emit_analog(v);
+        }
+        ing.cursor
+    }
+
+    #[cfg(windows)]
+    fn release_contact(&self, id: u32, route: Route) {
+        let action = self.process(id, 0.0, 0.0, false, route);
+        if let Some(w) = self.window() {
+            dispatch_cursor(&w, action);
+        }
     }
 
     fn emit_edges(&self, edges: Vec<(usize, bool)>) {
@@ -332,16 +546,21 @@ impl Bridge {
         }
     }
 
-    #[cfg(windows)]
-    pub fn take_latency_ms(&self) -> Option<f32> {
-        const STALE: std::time::Duration = std::time::Duration::from_millis(500);
-        let t = self.lock().last_down.take()?;
-        let elapsed = t.elapsed();
-        (elapsed < STALE).then_some(elapsed.as_secs_f32() * 1000.0)
-    }
-    #[cfg(not(windows))]
-    pub fn take_latency_ms(&self) -> Option<f32> {
-        None
+    fn emit_analog(&self, vals: [f32; FADER_COUNT]) {
+        let (listener, changed) = {
+            let mut st = self.lock();
+            let changed = st.last_analog != vals;
+            if changed {
+                st.last_analog = vals;
+            }
+            (st.on_analog.clone(), changed)
+        };
+        if !changed {
+            return;
+        }
+        if let Some(f) = listener {
+            f.call(vals[0], vals[1]);
+        }
     }
 
     #[cfg(windows)]
@@ -416,63 +635,25 @@ pub fn install(_bridge: &Arc<Bridge>, _win: slint::Weak<PChordWindow>) -> bool {
 }
 
 #[cfg(windows)]
-fn set_slot(win: &PChordWindow, s: usize, down: bool, x: f32, y: f32) {
-    use slint::ComponentHandle;
-    let mt = win.global::<crate::MultiTouch>();
-    macro_rules! slot {
-        ($set_x:ident, $set_y:ident, $set_a:ident) => {{
-            mt.$set_x(x);
-            mt.$set_y(y);
-            mt.$set_a(down);
-        }};
-    }
-    match s {
-        0 => slot!(set_x0, set_y0, set_a0),
-        1 => slot!(set_x1, set_y1, set_a1),
-        2 => slot!(set_x2, set_y2, set_a2),
-        3 => slot!(set_x3, set_y3, set_a3),
-        4 => slot!(set_x4, set_y4, set_a4),
-        5 => slot!(set_x5, set_y5, set_a5),
-        6 => slot!(set_x6, set_y6, set_a6),
-        7 => slot!(set_x7, set_y7, set_a7),
-        8 => slot!(set_x8, set_y8, set_a8),
-        _ => debug_assert!(false, "slot {s} is past MT_SLOTS ({MT_SLOTS})"),
-    }
-}
-
-#[cfg(windows)]
-fn apply(bridge: &Bridge, win: &PChordWindow, act: Act, id: u32) {
+fn dispatch_cursor(win: &PChordWindow, action: CursorAction) {
     use slint::platform::{PointerEventButton, WindowEvent};
     use slint::{ComponentHandle, LogicalPosition};
-
-    let (x, y, up) = match act {
-        Act::Down(x, y) | Act::Move(x, y) => (x, y, false),
-        Act::Up(x, y) => (x, y, true),
-        Act::Slot(_, down, x, y) => (x, y, !down),
-    };
-
-    let edges = {
-        let mut st = bridge.lock();
-        st.track_key(id, x, y, up)
-    };
-    bridge.emit_edges(edges);
-
-    match act {
-        Act::Down(..) => win.window().dispatch_event(WindowEvent::PointerPressed {
+    match action {
+        CursorAction::None => {}
+        CursorAction::Press(x, y) => win.window().dispatch_event(WindowEvent::PointerPressed {
             position: LogicalPosition::new(x, y),
             button: PointerEventButton::Left,
         }),
-        Act::Move(..) => win.window().dispatch_event(WindowEvent::PointerMoved {
+        CursorAction::Move(x, y) => win.window().dispatch_event(WindowEvent::PointerMoved {
             position: LogicalPosition::new(x, y),
         }),
-        Act::Up(..) => {
+        CursorAction::Release(x, y) => {
             win.window().dispatch_event(WindowEvent::PointerReleased {
                 position: LogicalPosition::new(x, y),
                 button: PointerEventButton::Left,
             });
             win.window().dispatch_event(WindowEvent::PointerExited);
         }
-        Act::Slot(s, down, ..) => set_slot(win, s, down, x, y),
     }
 }
 
@@ -484,6 +665,7 @@ mod win {
     const SUBCLASS_ID: usize = 0x5043_4831;
 
     const WM_WINDOWPOSCHANGING: u32 = 0x0046;
+    const WM_DISPLAYCHANGE: u32 = 0x007E;
     const WM_TOUCH: u32 = 0x0240;
     const WM_POINTERUPDATE: u32 = 0x0245;
     const WM_POINTERDOWN: u32 = 0x0246;
@@ -578,7 +760,7 @@ mod win {
     fn announce_once(route: &str) {
         static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::info!("{route} intercepted; {MT_SLOTS} extra contacts routed");
+            log::info!("{route} intercepted; all contacts routed to the flat table");
         }
     }
 
@@ -597,14 +779,14 @@ mod win {
             || (info.pointerType != PT_TOUCH && info.pointerType != PT_PEN)
         {
             if releasing {
-                release_lost(bridge, id);
+                bridge.release_contact(id, Route::Pointer);
                 return true;
             }
             return false;
         }
         let Some(w) = bridge.window() else {
             if releasing {
-                release_lost(bridge, id);
+                bridge.release_contact(id, Route::Pointer);
                 return true;
             }
             return false;
@@ -621,35 +803,23 @@ mod win {
         announce_once("WM_POINTER");
         let flags = info.pointerFlags;
         let canceled = flags & POINTER_FLAG_CANCELED != 0;
-        let down = msg == WM_POINTERDOWN && !canceled;
         let up = msg == WM_POINTERUP
             || msg == WM_POINTERLEAVE
             || canceled
             || (flags & POINTER_FLAG_INCONTACT) == 0;
-        let act = {
-            let mut st = bridge.lock();
-            if down {
-                st.stamp_down(x, y);
-            }
-            st.classify(id, down, up, x, y)
-        };
-        if let Some(act) = act {
-            apply(bridge, &w, act, id);
-        } else if up {
-            let edges = bridge.lock().track_key(id, x, y, true);
-            bridge.emit_edges(edges);
-        }
+        let action = bridge.process(id, x, y, !up, Route::Pointer);
+        dispatch_cursor(&w, action);
         true
     }
 
-    unsafe fn release_lost(bridge: &Bridge, id: u32) {
-        let act = bridge.lock().classify(id, false, true, 0.0, 0.0);
-        if let (Some(act), Some(w)) = (act, bridge.window()) {
-            apply(bridge, &w, act, id);
-            return;
+    pub(super) fn pointer_still_down(id: u32) -> bool {
+        use windows_sys::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
+        unsafe {
+            let mut info: POINTER_INFO = core::mem::zeroed();
+            GetPointerInfo(id, &mut info) != 0
+                && info.pointerFlags & POINTER_FLAG_INCONTACT != 0
+                && info.pointerFlags & POINTER_FLAG_CANCELED == 0
         }
-        let edges = bridge.lock().track_key(id, 0.0, 0.0, true);
-        bridge.emit_edges(edges);
     }
 
     unsafe fn handle_touch(bridge: &Bridge, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -658,8 +828,6 @@ mod win {
         use windows_sys::Win32::UI::Input::Touch::{
             CloseTouchInputHandle, GetTouchInputInfo, TOUCHEVENTF_DOWN, TOUCHEVENTF_UP, TOUCHINPUT,
         };
-
-        const MAX_CONTACTS: usize = 1 + MT_SLOTS;
 
         let reported = wparam & 0xffff;
         let count = reported.min(MAX_CONTACTS);
@@ -683,35 +851,22 @@ mod win {
         let scale = w.window().scale_factor().max(0.01);
         announce_once("WM_TOUCH");
 
-        let mut acts: Vec<(u32, Act)> = Vec::with_capacity(count);
-        let mut orphan_edges: Vec<(usize, bool)> = Vec::new();
-        {
-            let mut st = bridge.lock();
-            st.stats.dropped += (reported - count) as u64;
-            for ti in &inputs[..count] {
-                let mut pt = POINT {
-                    x: ti.x / 100,
-                    y: ti.y / 100,
-                };
-                ScreenToClient(hwnd, &mut pt);
-                let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
-                let down = ti.dwFlags & TOUCHEVENTF_DOWN != 0;
-                let up = ti.dwFlags & TOUCHEVENTF_UP != 0;
-                if down {
-                    st.stamp_down(x, y);
-                }
-                if let Some(act) = st.classify(ti.dwID, down, up, x, y) {
-                    acts.push((ti.dwID, act));
-                } else if up {
-                    orphan_edges.extend(st.track_key(ti.dwID, x, y, true));
-                }
-            }
+        let mut cursors: Vec<CursorAction> = Vec::with_capacity(count);
+        for ti in &inputs[..count] {
+            let mut pt = POINT {
+                x: ti.x / 100,
+                y: ti.y / 100,
+            };
+            ScreenToClient(hwnd, &mut pt);
+            let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
+            let up = ti.dwFlags & TOUCHEVENTF_UP != 0;
+            let _ = TOUCHEVENTF_DOWN;
+            cursors.push(bridge.process(ti.dwID, x, y, !up, Route::Touch));
         }
         CloseTouchInputHandle(handle);
 
-        bridge.emit_edges(orphan_edges);
-        for (id, act) in acts {
-            apply(bridge, &w, act, id);
+        for action in cursors {
+            dispatch_cursor(&w, action);
         }
         true
     }
@@ -749,6 +904,12 @@ mod win {
             return MA_NOACTIVATE as LRESULT;
         }
 
+        if msg == WM_DISPLAYCHANGE {
+            log::info!("WM_DISPLAYCHANGE — desktop reconfigured; will re-pin the pad");
+            bridge.lock().displays_changed = true;
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+
         if msg == WM_WINDOWPOSCHANGING && bridge.is_mine(hwnd as isize) {
             use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS};
             let wp = &mut *(lparam as *mut WINDOWPOS);
@@ -776,7 +937,7 @@ mod win {
         }
 
         if msg == WM_POINTERCAPTURECHANGED && bridge.is_mine(hwnd as isize) {
-            release_lost(bridge, (wparam & 0xffff) as u32);
+            bridge.release_contact((wparam & 0xffff) as u32, Route::Pointer);
             return 0;
         }
 
@@ -785,11 +946,17 @@ mod win {
             WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERLEAVE | WM_TOUCH
         );
         if touch && bridge.is_mine(hwnd as isize) {
-            let handled = if msg == WM_TOUCH {
-                handle_touch(bridge, hwnd, wparam, lparam)
-            } else {
-                handle_pointer(bridge, hwnd, msg, wparam)
-            };
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if msg == WM_TOUCH {
+                    handle_touch(bridge, hwnd, wparam, lparam)
+                } else {
+                    handle_pointer(bridge, hwnd, msg, wparam)
+                }
+            }))
+            .unwrap_or_else(|_| {
+                log::error!("panic while handling touch message {msg:#06x}; contact dropped");
+                false
+            });
             if handled {
                 return 0;
             }
@@ -806,16 +973,6 @@ pub use win::install;
 mod tests {
     use super::*;
 
-    fn down(st: &mut State, id: u32, x: f32, y: f32) -> Option<Act> {
-        st.classify(id, true, false, x, y)
-    }
-    fn moved(st: &mut State, id: u32, x: f32, y: f32) -> Option<Act> {
-        st.classify(id, false, false, x, y)
-    }
-    fn up(st: &mut State, id: u32, x: f32, y: f32) -> Option<Act> {
-        st.classify(id, false, true, x, y)
-    }
-
     fn geom() -> KeyGeom {
         KeyGeom {
             x: 0.0,
@@ -827,114 +984,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn first_contact_drives_the_ordinary_pointer_path() {
-        let mut st = State::default();
-        assert_eq!(down(&mut st, 7, 10.0, 20.0), Some(Act::Down(10.0, 20.0)));
-        assert_eq!(moved(&mut st, 7, 11.0, 20.0), Some(Act::Move(11.0, 20.0)));
-        assert_eq!(up(&mut st, 7, 11.0, 20.0), Some(Act::Up(11.0, 20.0)));
-        assert_eq!(st.primary, None);
-    }
-
-    #[test]
-    fn further_contacts_fill_slots_and_track() {
-        let mut st = State::default();
-        down(&mut st, 1, 0.0, 0.0);
-        assert_eq!(
-            down(&mut st, 2, 5.0, 6.0),
-            Some(Act::Slot(0, true, 5.0, 6.0))
-        );
-        assert_eq!(
-            down(&mut st, 3, 7.0, 8.0),
-            Some(Act::Slot(1, true, 7.0, 8.0))
-        );
-        assert_eq!(
-            moved(&mut st, 2, 5.0, 9.0),
-            Some(Act::Slot(0, true, 5.0, 9.0))
-        );
-        assert_eq!(
-            up(&mut st, 2, 5.0, 9.0),
-            Some(Act::Slot(0, false, 5.0, 9.0))
-        );
-        assert_eq!(st.slots[0], None);
-        assert_eq!(st.slots[1], Some(3));
-        assert_eq!(
-            down(&mut st, 4, 1.0, 1.0),
-            Some(Act::Slot(0, true, 1.0, 1.0))
-        );
-    }
-
-    #[test]
-    fn a_lifted_primary_does_not_promote_an_extra() {
-        let mut st = State::default();
-        down(&mut st, 1, 0.0, 0.0);
-        down(&mut st, 2, 5.0, 5.0);
-        up(&mut st, 1, 0.0, 0.0);
-        assert_eq!(st.primary, None);
-        assert_eq!(st.slots[0], Some(2));
-        assert_eq!(
-            moved(&mut st, 2, 6.0, 5.0),
-            Some(Act::Slot(0, true, 6.0, 5.0))
-        );
-    }
-
-    #[test]
-    fn a_full_hand_of_contacts_is_accepted() {
-        let mut st = State::default();
-        for id in 1..=(MT_SLOTS as u32 + 1) {
-            assert!(down(&mut st, id, id as f32, 0.0).is_some(), "contact {id}");
+    fn with_keys() -> State {
+        State {
+            key_geom: geom(),
+            ..State::default()
         }
-        assert_eq!(st.stats.live, MT_SLOTS + 1);
-        assert_eq!(st.stats.peak, MT_SLOTS + 1);
-        assert_eq!(st.stats.dropped, 0);
-        for (s, held) in st.slots.iter().enumerate() {
-            assert_eq!(*held, Some(s as u32 + 2), "slot {s}");
-        }
-        assert_eq!(st.primary, Some(1));
+    }
+
+    fn down(st: &mut State, id: u32, x: f32, y: f32) -> Ingest {
+        st.ingest(id, x, y, true)
+    }
+    fn up(st: &mut State, id: u32, x: f32, y: f32) -> Ingest {
+        st.ingest(id, x, y, false)
     }
 
     #[test]
-    fn contacts_beyond_the_slots_are_dropped_not_stolen_and_counted() {
-        let mut st = State::default();
-        for id in 1..=(MT_SLOTS as u32 + 1) {
-            down(&mut st, id, 0.0, 0.0);
-        }
-        let overflow = MT_SLOTS as u32 + 2;
-        assert_eq!(down(&mut st, overflow, 3.0, 3.0), None);
-        assert_eq!(st.stats.dropped, 1);
-        assert_eq!(moved(&mut st, overflow, 4.0, 3.0), None);
-        assert_eq!(up(&mut st, overflow, 4.0, 3.0), None);
-        assert_eq!(st.slots[0], Some(2));
-        assert_eq!(st.primary, Some(1));
-    }
-
-    #[test]
-    fn peak_is_a_high_water_mark_and_live_falls_back() {
-        let mut st = State::default();
-        down(&mut st, 1, 0.0, 0.0);
-        down(&mut st, 2, 0.0, 0.0);
-        down(&mut st, 3, 0.0, 0.0);
-        assert_eq!(st.stats.live, 3);
-        up(&mut st, 2, 0.0, 0.0);
-        up(&mut st, 3, 0.0, 0.0);
+    fn a_single_contact_presses_and_releases_its_key() {
+        let mut st = with_keys();
+        let edges = down(&mut st, 7, 45.0, 150.0).key_edges;
+        assert_eq!(edges, vec![(0, true)]);
+        assert!(st.held[0]);
         assert_eq!(st.stats.live, 1);
-        assert_eq!(st.stats.peak, 3, "peak must not fall with the fingers");
+        let edges = up(&mut st, 7, 45.0, 150.0).key_edges;
+        assert_eq!(edges, vec![(0, false)]);
+        assert_eq!(st.stats.live, 0);
     }
 
     #[test]
-    fn a_slot_freed_and_refilled_in_one_frame_keeps_the_new_contact() {
-        let mut st = State::default();
-        down(&mut st, 1, 0.0, 0.0);
-        down(&mut st, 2, 5.0, 5.0);
-        assert_eq!(
-            up(&mut st, 2, 5.0, 5.0),
-            Some(Act::Slot(0, false, 5.0, 5.0))
-        );
-        assert_eq!(
-            down(&mut st, 9, 80.0, 90.0),
-            Some(Act::Slot(0, true, 80.0, 90.0))
-        );
-        assert_eq!(st.slots[0], Some(9));
+    fn ten_contacts_are_all_kept_and_none_dropped() {
+        let mut st = with_keys();
+        for id in 0..10u32 {
+            let x = geom().center(id as usize % KEY_COUNT);
+            down(&mut st, id, x, 150.0);
+        }
+        assert_eq!(st.stats.live, 10);
+        assert_eq!(st.stats.peak, 10);
+        assert_eq!(st.stats.dropped, 0);
+    }
+
+    #[test]
+    fn past_the_ceiling_contacts_are_dropped_not_stolen() {
+        let mut st = with_keys();
+        for id in 0..(MAX_CONTACTS as u32) {
+            down(&mut st, id, geom().center(0), 150.0);
+        }
+        assert_eq!(st.stats.live, MAX_CONTACTS);
+        let overflow = MAX_CONTACTS as u32;
+        let ing = down(&mut st, overflow, 45.0, 150.0);
+        assert!(ing.key_edges.is_empty());
+        assert_eq!(st.stats.dropped, 1);
+        assert_eq!(st.stats.live, MAX_CONTACTS);
+    }
+
+    #[test]
+    fn two_contacts_on_the_same_key_hold_it_until_both_lift() {
+        let mut st = with_keys();
+        assert_eq!(down(&mut st, 1, 45.0, 150.0).key_edges, vec![(0, true)]);
+        assert!(down(&mut st, 2, 46.0, 150.0).key_edges.is_empty());
+        assert!(st.held[0]);
+        assert!(up(&mut st, 1, 45.0, 150.0).key_edges.is_empty());
+        assert!(st.held[0]);
+        assert_eq!(up(&mut st, 2, 46.0, 150.0).key_edges, vec![(0, false)]);
+        assert!(!st.held[0]);
     }
 
     #[test]
@@ -954,90 +1065,179 @@ mod tests {
     }
 
     #[test]
-    fn reused_pointer_id_on_down_does_not_keep_old_key() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
-        down(&mut st, 1, 0.0, 0.0);
-        down(&mut st, 2, 0.0, 0.0);
-        assert!(down(&mut st, 99, 145.0, 150.0).is_some());
-        st.stats.live = 3;
-        assert_eq!(st.track_key(99, 145.0, 150.0, false), vec![(1, true)]);
-        assert!(down(&mut st, 99, 1045.0, 150.0).is_some());
-        let edges = st.track_key(99, 1045.0, 150.0, false);
-        assert!(edges.contains(&(1, false)), "{edges:?}");
-        assert!(edges.contains(&(10, true)), "{edges:?}");
-        assert!(!st.held[1]);
-        assert!(st.held[10]);
+    fn a_contact_sliding_along_the_row_moves_the_held_key() {
+        let mut st = with_keys();
+        assert_eq!(down(&mut st, 1, 45.0, 150.0).key_edges, vec![(0, true)]);
+        let edges = down(&mut st, 1, 145.0, 150.0).key_edges;
+        assert!(edges.contains(&(0, false)), "{edges:?}");
+        assert!(edges.contains(&(1, true)), "{edges:?}");
+        assert!(!st.held[0] && st.held[1]);
     }
 
     #[test]
-    fn track_key_emits_edges_and_clears_on_up() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
+    fn disabling_keys_releases_everything_held() {
+        let mut st = with_keys();
         down(&mut st, 1, 45.0, 150.0);
-        let edges = st.track_key(1, 45.0, 150.0, false);
-        assert_eq!(edges, vec![(0, true)]);
         assert!(st.held[0]);
-        st.stats.live = 0;
-        let edges = st.track_key(1, 45.0, 150.0, true);
+        st.keys_enabled = false;
+        for c in st.contacts.values_mut() {
+            c.key = None;
+        }
+        let edges = st.recompute_held();
         assert_eq!(edges, vec![(0, false)]);
     }
 
     #[test]
-    fn a_contact_that_lost_its_down_is_adopted_on_the_next_move() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
-        assert_eq!(
-            moved(&mut st, 42, 45.0, 150.0),
-            Some(Act::Down(45.0, 150.0))
-        );
-        assert_eq!(st.primary, Some(42));
-        assert_eq!(st.stats.adopted, 1);
-        assert_eq!(st.track_key(42, 45.0, 150.0, false), vec![(0, true)]);
-    }
-
-    #[test]
-    fn adoption_uses_a_slot_when_the_primary_is_taken() {
-        let mut st = State::default();
-        down(&mut st, 1, 0.0, 0.0);
-        assert_eq!(
-            moved(&mut st, 77, 5.0, 6.0),
-            Some(Act::Slot(0, true, 5.0, 6.0))
-        );
-        assert_eq!(st.slots[0], Some(77));
-        assert_eq!(st.stats.adopted, 1);
-        assert_eq!(st.stats.live, 2);
-    }
-
-    #[test]
-    fn a_genuine_new_contact_is_not_counted_as_adopted_or_revived() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
+    fn reset_contacts_releases_every_key_and_clears_the_table() {
+        let mut st = with_keys();
         down(&mut st, 1, 45.0, 150.0);
-        st.track_key(1, 45.0, 150.0, false);
-        assert_eq!(st.stats.adopted, 0);
-        assert_eq!(st.stats.revived, 0, "a first press is not a revival");
+        down(&mut st, 2, 145.0, 150.0);
+        let edges = st.reset_contacts();
+        assert_eq!(st.stats.live, 0);
+        assert!(st.contacts.is_empty());
+        assert!(edges.contains(&(0, false)));
+        assert!(edges.contains(&(1, false)));
+        assert!(
+            st.quiet_contacts(std::time::Duration::ZERO).is_empty(),
+            "a released contact must not be left for the watchdog to find"
+        );
     }
 
     #[test]
-    fn a_contact_whose_key_mapping_was_wiped_is_counted_as_revived() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
-        down(&mut st, 1, 45.0, 150.0);
-        st.track_key(1, 45.0, 150.0, false);
-        st.clear_all_keys();
-        assert_eq!(st.track_key(1, 45.0, 150.0, false), vec![(0, true)]);
-        assert_eq!(st.stats.revived, 1);
+    fn only_silent_contacts_are_offered_to_the_watchdog() {
+        let silent = std::time::Duration::from_millis(400);
+        let mut st = with_keys();
+        down(&mut st, 7, 45.0, 150.0);
+        down(&mut st, 8, 145.0, 150.0);
+        assert!(st.quiet_contacts(silent).is_empty());
+
+        if let Some(c) = st.contacts.get_mut(&7) {
+            c.seen = Instant::now() - std::time::Duration::from_secs(1);
+        }
+        assert_eq!(st.quiet_contacts(silent), vec![7]);
+
+        st.restamp(7);
+        assert!(st.quiet_contacts(silent).is_empty());
+    }
+
+    #[test]
+    fn the_top_strip_is_chrome_but_the_key_band_is_not() {
+        let st = with_keys();
+        assert!(st.is_chrome_point(20.0, 20.0));
+        assert!(!st.is_chrome_point(45.0, 150.0));
+    }
+
+    #[test]
+    fn an_overlay_makes_the_whole_screen_chrome() {
+        let mut st = with_keys();
+        st.keys_enabled = false;
+        assert!(st.is_chrome_point(45.0, 150.0));
+    }
+
+    #[test]
+    fn a_chrome_contact_becomes_the_cursor_and_a_key_contact_does_not() {
+        let mut st = with_keys();
+        assert_eq!(down(&mut st, 1, 45.0, 150.0).cursor, CursorAction::None);
+        assert_eq!(st.cursor, None);
+        assert_eq!(
+            down(&mut st, 2, 20.0, 20.0).cursor,
+            CursorAction::Press(20.0, 20.0)
+        );
+        assert_eq!(st.cursor, Some(2));
+        assert_eq!(
+            down(&mut st, 2, 30.0, 25.0).cursor,
+            CursorAction::Move(30.0, 25.0)
+        );
+        assert_eq!(
+            up(&mut st, 2, 30.0, 25.0).cursor,
+            CursorAction::Release(30.0, 25.0)
+        );
+        assert_eq!(st.cursor, None);
+    }
+
+    #[test]
+    fn a_finger_already_down_cannot_claim_the_cursor_when_an_overlay_opens() {
+        let mut st = with_keys();
+        assert_eq!(down(&mut st, 1, 45.0, 150.0).key_edges, vec![(0, true)]);
+        assert_eq!(st.cursor, None);
+
+        assert_eq!(
+            down(&mut st, 2, 20.0, 20.0).cursor,
+            CursorAction::Press(20.0, 20.0)
+        );
+        st.keys_enabled = false;
+        for c in st.contacts.values_mut() {
+            c.key = None;
+        }
+        st.recompute_held();
+        assert_eq!(
+            up(&mut st, 2, 20.0, 20.0).cursor,
+            CursorAction::Release(20.0, 20.0)
+        );
+        assert_eq!(st.cursor, None);
+
+        assert_eq!(down(&mut st, 1, 46.0, 151.0).cursor, CursorAction::None);
+        assert_eq!(down(&mut st, 1, 48.0, 152.0).cursor, CursorAction::None);
+        assert_eq!(st.cursor, None);
+
+        assert_eq!(
+            down(&mut st, 3, 300.0, 400.0).cursor,
+            CursorAction::Press(300.0, 400.0)
+        );
+        assert_eq!(st.cursor, Some(3));
+    }
+
+    #[test]
+    fn a_contact_that_arrived_while_the_cursor_was_taken_never_inherits_it() {
+        let mut st = with_keys();
+        assert_eq!(
+            down(&mut st, 1, 20.0, 20.0).cursor,
+            CursorAction::Press(20.0, 20.0)
+        );
+        assert_eq!(down(&mut st, 2, 40.0, 20.0).cursor, CursorAction::None);
+        assert_eq!(
+            up(&mut st, 1, 20.0, 20.0).cursor,
+            CursorAction::Release(20.0, 20.0)
+        );
+        assert_eq!(down(&mut st, 2, 41.0, 21.0).cursor, CursorAction::None);
+        assert_eq!(st.cursor, None);
+
+        assert_eq!(up(&mut st, 2, 41.0, 21.0).cursor, CursorAction::None);
+        assert_eq!(
+            down(&mut st, 2, 41.0, 21.0).cursor,
+            CursorAction::Press(41.0, 21.0)
+        );
+        assert_eq!(st.cursor, Some(2));
+    }
+
+    #[test]
+    fn only_one_cursor_at_a_time() {
+        let mut st = with_keys();
+        assert_eq!(
+            down(&mut st, 1, 20.0, 20.0).cursor,
+            CursorAction::Press(20.0, 20.0)
+        );
+        assert_eq!(down(&mut st, 2, 40.0, 20.0).cursor, CursorAction::None);
+        assert_eq!(st.cursor, Some(1));
+    }
+
+    #[test]
+    fn the_mouse_contact_never_drives_the_cursor() {
+        let mut st = with_keys();
+        assert_eq!(
+            down(&mut st, MOUSE_CONTACT, 20.0, 20.0).cursor,
+            CursorAction::None
+        );
+        assert_eq!(st.cursor, None);
+    }
+
+    #[test]
+    fn display_change_flag_is_one_shot() {
+        let b = Bridge::create();
+        assert!(!b.take_display_change(), "starts clear");
+        b.lock().displays_changed = true;
+        assert!(b.take_display_change(), "reports the change once");
+        assert!(!b.take_display_change(), "and clears itself");
     }
 
     #[cfg(windows)]
@@ -1063,25 +1263,6 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn holding_position_ignores_fields_windows_will_not_read() {
-        let b = Bridge::create();
-        b.set_pinned(Some(PinRect {
-            left: 0,
-            top: 1440,
-            width: 1920,
-            height: 1080,
-        }));
-
-        let (mut x, mut y, mut cx, mut cy) = (0, 1440, 12345, 6789);
-        assert_eq!(
-            b.hold_position(true, false, &mut x, &mut y, &mut cx, &mut cy),
-            None
-        );
-        assert_eq!(b.vetoed_moves(), 0);
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn windowed_mode_leaves_the_window_alone() {
         let b = Bridge::create();
         b.set_pinned(None);
@@ -1091,25 +1272,5 @@ mod tests {
             None
         );
         assert_eq!((x, y, cx, cy), (100, 200, 1280, 720));
-    }
-
-    #[test]
-    fn reset_contacts_releases_everything() {
-        let mut st = State {
-            key_geom: geom(),
-            ..State::default()
-        };
-        down(&mut st, 1, 45.0, 150.0);
-        down(&mut st, 2, 145.0, 150.0);
-        st.track_key(1, 45.0, 150.0, false);
-        st.track_key(2, 145.0, 150.0, false);
-
-        let edges = st.reset_contacts();
-
-        assert_eq!(st.stats.live, 0);
-        assert!(st.primary.is_none());
-        assert!(st.slots.iter().all(Option::is_none));
-        assert!(edges.contains(&(0, false)));
-        assert!(edges.contains(&(1, false)));
     }
 }

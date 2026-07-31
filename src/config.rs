@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub relative_faders: bool,
     pub fader_decay: f32,
-    pub fader_tick_ms: i64,
     pub fader_dead: f32,
     pub fader_curve: f32,
     pub fader_rel_travel: f32,
     pub fader_speed_dead: f32,
     pub playfield_fit: f32,
+    #[serde(default = "default_key_height")]
+    pub key_height: f32,
+    #[serde(default)]
+    pub fader_pos: f32,
     pub diagnostics: bool,
     pub api_port: u16,
     #[serde(default)]
@@ -29,17 +32,22 @@ fn default_mon_auto() -> i32 {
     -1
 }
 
+fn default_key_height() -> f32 {
+    0.66
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             relative_faders: true,
             fader_decay: 0.7,
-            fader_tick_ms: 16,
             fader_dead: 0.04,
             fader_curve: 1.0,
             fader_rel_travel: 100.0,
             fader_speed_dead: 2.5,
             playfield_fit: 1.0,
+            key_height: 0.66,
+            fader_pos: 0.0,
             diagnostics: false,
             api_port: crate::spiceapi::DEFAULT_PORT,
             light_keys: false,

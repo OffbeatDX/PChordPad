@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::diagnostics::Diagnostics;
+use crate::faders::{FaderCfg, Zone, FADER_COUNT};
 use crate::monitor;
 use crate::navmirror::NavMirror;
 use crate::spiceapi;
@@ -10,6 +11,27 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+const BUTTON_NAMES: [&str; touchbridge::KEY_COUNT] = [
+    "Button 1",
+    "Button 2",
+    "Button 3",
+    "Button 4",
+    "Button 5",
+    "Button 6",
+    "Button 7",
+    "Button 8",
+    "Button 9",
+    "Button 10",
+    "Button 11",
+    "Button 12",
+];
+
+fn set_if_changed<T: PartialEq>(want: T, current: T, set: impl FnOnce(T)) {
+    if want != current {
+        set(want);
+    }
+}
+
 pub struct Runtime {
     pub diag: Rc<RefCell<Diagnostics>>,
     pub bridge: Arc<touchbridge::Bridge>,
@@ -19,6 +41,7 @@ pub struct Runtime {
     pub keys: Rc<VecModel<bool>>,
     pub log: Rc<VecModel<slint::SharedString>>,
     pub windowed: Rc<Cell<bool>>,
+    diag_dirty: Rc<Cell<bool>>,
 }
 
 impl Runtime {
@@ -33,18 +56,20 @@ impl Runtime {
             keys: Rc::new(VecModel::from(vec![false; 12])),
             log: Rc::new(VecModel::default()),
             windowed: Rc::new(Cell::new(cfg.windowed)),
+            diag_dirty: Rc::new(Cell::new(true)),
         }
     }
 
     pub fn apply_config(w: &PChordWindow, cfg: &Config) {
         w.set_relative_faders(cfg.relative_faders);
         w.set_fader_decay(cfg.fader_decay);
-        w.set_fader_tick(cfg.fader_tick_ms);
         w.set_fader_dead(cfg.fader_dead);
         w.set_fader_curve(cfg.fader_curve);
         w.set_fader_rel_travel(cfg.fader_rel_travel);
         w.set_fader_speed_dead(cfg.fader_speed_dead);
         w.set_playfield_fit(cfg.playfield_fit);
+        w.set_key_height(cfg.key_height);
+        w.set_fader_pos(cfg.fader_pos);
         w.set_diagnostics(cfg.diagnostics);
         w.set_api_port(cfg.api_port as i32);
         w.set_light_keys(cfg.light_keys);
@@ -62,12 +87,13 @@ impl Runtime {
         Config {
             relative_faders: w.get_relative_faders(),
             fader_decay: w.get_fader_decay(),
-            fader_tick_ms: w.get_fader_tick(),
             fader_dead: w.get_fader_dead(),
             fader_curve: w.get_fader_curve(),
             fader_rel_travel: w.get_fader_rel_travel(),
             fader_speed_dead: w.get_fader_speed_dead(),
             playfield_fit: w.get_playfield_fit(),
+            key_height: w.get_key_height(),
+            fader_pos: w.get_fader_pos(),
             diagnostics: w.get_diagnostics(),
             api_port: w.get_api_port().clamp(1, 65535) as u16,
             light_keys: w.get_light_keys(),
@@ -149,6 +175,9 @@ impl Runtime {
                     bridge.set_pinned(None);
                     return;
                 }
+                if bridge.restore_if_minimized() {
+                    return;
+                }
                 bridge.set_pinned(Self::pad_mon(&w).map(|m| touchbridge::PinRect {
                     left: m.left,
                     top: m.top,
@@ -161,16 +190,52 @@ impl Runtime {
         t
     }
 
-    pub fn sync_key_geom(bridge: &touchbridge::Bridge, w: &PChordWindow) {
-        let panel_y = w.get_panel_y();
-        bridge.set_key_geom(touchbridge::KeyGeom {
+    pub fn key_geom_of(w: &PChordWindow) -> touchbridge::KeyGeom {
+        touchbridge::KeyGeom {
             x: w.get_key_geom_x(),
-            y: panel_y + w.get_key_geom_y(),
+            y: w.get_panel_y() + w.get_key_geom_y(),
             w: w.get_key_geom_w(),
             h: w.get_key_geom_h(),
             key_w: w.get_key_geom_key_w(),
             gap: w.get_key_geom_gap(),
-        });
+        }
+    }
+
+    pub fn sync_key_geom(bridge: &touchbridge::Bridge, w: &PChordWindow) {
+        bridge.set_key_geom(Self::key_geom_of(w));
+    }
+
+    pub fn fader_zones_of(w: &PChordWindow) -> [Zone; FADER_COUNT] {
+        let py = w.get_panel_y();
+        [
+            Zone {
+                x: w.get_fader_l_geom_x(),
+                y: py + w.get_fader_l_geom_y(),
+                w: w.get_fader_l_geom_w(),
+                h: w.get_fader_l_geom_h(),
+                center_x: w.get_fader_l_geom_center_x(),
+                half: w.get_fader_l_geom_half(),
+            },
+            Zone {
+                x: w.get_fader_r_geom_x(),
+                y: py + w.get_fader_r_geom_y(),
+                w: w.get_fader_r_geom_w(),
+                h: w.get_fader_r_geom_h(),
+                center_x: w.get_fader_r_geom_center_x(),
+                half: w.get_fader_r_geom_half(),
+            },
+        ]
+    }
+
+    pub fn fader_cfg_of(w: &PChordWindow) -> FaderCfg {
+        FaderCfg {
+            relative: w.get_relative_faders(),
+            curve: w.get_fader_curve(),
+            dead: w.get_fader_dead(),
+            decay: w.get_fader_decay(),
+            rel_travel: w.get_fader_rel_travel(),
+            speed_dead: w.get_fader_speed_dead(),
+        }
     }
 
     pub fn sync_keys_enabled(bridge: &touchbridge::Bridge, w: &PChordWindow) {
@@ -214,8 +279,8 @@ impl Runtime {
         w.set_mouse_keys(true);
 
         self.bind_nav(w);
-        self.bind_keys(w);
-        self.bind_analog(w);
+        self.bind_keys();
+        self.bind_analog();
         self.bind_mouse_key(w);
         self.bind_mark(w);
         self.bind_quit(w);
@@ -227,6 +292,7 @@ impl Runtime {
         let diag = self.diag.clone();
         let api = self.api.clone();
         let bridge = self.bridge.clone();
+        let keys = self.keys.clone();
         let log_model = self.log.clone();
 
         w.on_mark_stall(move || {
@@ -236,23 +302,16 @@ impl Runtime {
                 None => "spiceapi client: none".into(),
             };
             let detail = format!(
-                "touch live={} peak={} dropped={} adopted={} revived={} vetoed_moves={}\n{api_snap}",
+                "touch live={} peak={} dropped={} vetoed_moves={} expired={}\n{api_snap}",
                 touch.live,
                 touch.peak,
                 touch.dropped,
-                touch.adopted,
-                touch.revived,
-                bridge.vetoed_moves()
+                bridge.vetoed_moves(),
+                bridge.expired_contacts()
             );
             let banner = diag.borrow_mut().mark_stall(&detail);
             let Some(w) = weak.upgrade() else { return };
-            let d = diag.borrow();
-            log_model.set_vec(
-                d.log_lines()
-                    .map(slint::SharedString::from)
-                    .collect::<Vec<_>>(),
-            );
-            w.set_latency(d.latency_summary().into());
+            Self::refresh_diagnostics(&w, &diag, &keys, &log_model);
             let _ = banner;
         });
     }
@@ -298,59 +357,57 @@ impl Runtime {
         });
     }
 
-    fn bind_keys(&self, w: &PChordWindow) {
-        let weak = w.as_weak();
+    fn bind_keys(&self) {
         let diag = self.diag.clone();
-        let bridge_latency = self.bridge.clone();
         let api = self.api.clone();
-        let keys = self.keys.clone();
-        let log = self.log.clone();
+        let dirty = self.diag_dirty.clone();
 
         self.bridge.set_key_listener(move |index, down| {
-            let name = format!("Button {}", index + 1);
+            let name = BUTTON_NAMES[index.min(BUTTON_NAMES.len() - 1)];
             if let Some(api) = api.borrow().as_ref() {
-                api.button(&name, down);
+                api.button(name, down);
             }
-            if down {
-                if let Some(ms) = bridge_latency.take_latency_ms() {
-                    diag.borrow_mut().on_latency(ms);
-                }
-            }
-            diag.borrow_mut().on_digital(&name, down);
-            let Some(w) = weak.upgrade() else { return };
-            let d = diag.borrow();
-            for (i, on) in d.keys().iter().enumerate() {
-                if keys.row_data(i) != Some(*on) {
-                    keys.set_row_data(i, *on);
-                }
-            }
-            log.set_vec(
-                d.log_lines()
-                    .map(slint::SharedString::from)
-                    .collect::<Vec<_>>(),
-            );
-            w.set_digital_events(d.digital_events() as i32);
-            w.set_analog_events(d.analog_events() as i32);
-            w.set_latency(d.latency_summary().into());
+            diag.borrow_mut().on_digital(name, down);
+            dirty.set(true);
         });
     }
 
-    fn bind_analog(&self, w: &PChordWindow) {
+    fn refresh_diagnostics(
+        w: &PChordWindow,
+        diag: &RefCell<Diagnostics>,
+        keys: &VecModel<bool>,
+        log: &VecModel<slint::SharedString>,
+    ) {
+        let d = diag.borrow();
+        for (i, on) in d.keys().iter().enumerate() {
+            if keys.row_data(i) != Some(*on) {
+                keys.set_row_data(i, *on);
+            }
+        }
+        if !w.get_diagnostics() {
+            return;
+        }
+        log.set_vec(
+            d.log_lines()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        );
+        w.set_digital_events(d.digital_events() as i32);
+        w.set_analog_events(d.analog_events() as i32);
+    }
+
+    fn bind_analog(&self) {
         let diag = self.diag.clone();
         let api = self.api.clone();
-        let levels = std::cell::Cell::new((0.0f32, 0.0f32));
-        w.on_analog(move |name, value| {
-            let (mut l, mut r) = levels.get();
-            match name.as_str() {
-                "Fader-L" => l = value,
-                "Fader-R" => r = value,
-                _ => log::warn!("unexpected analog {name}"),
-            }
-            levels.set((l, r));
+        let dirty = self.diag_dirty.clone();
+        self.bridge.set_analog_listener(move |l, r| {
             if let Some(api) = api.borrow().as_ref() {
                 api.faders(l, r);
             }
-            diag.borrow_mut().on_analog(&name, value);
+            let mut d = diag.borrow_mut();
+            d.on_analog("Fader-L", l);
+            d.on_analog("Fader-R", r);
+            dirty.set(true);
         });
     }
 
@@ -433,10 +490,20 @@ impl Runtime {
         let nav = self.nav.clone();
         let weak = w.as_weak();
         let api = self.api.clone();
+        let diag = self.diag.clone();
+        let keys = self.keys.clone();
+        let log = self.log.clone();
+        let dirty = self.diag_dirty.clone();
+        let windowed = self.windowed.clone();
         let installed = std::cell::Cell::new(false);
         let nav_generation = std::cell::Cell::new(0u64);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let last_tick = std::cell::Cell::new(std::time::Instant::now());
+        let last_geom = std::cell::Cell::new(touchbridge::KeyGeom::default());
+        let last_fader_zones = std::cell::Cell::new([Zone::default(); FADER_COUNT]);
+        let last_fader_cfg = std::cell::Cell::new(FaderCfg::default());
+        let last_diag_open = std::cell::Cell::new(false);
+        let api_epoch = std::cell::Cell::new(0u64);
         const TICK_LATE: std::time::Duration = std::time::Duration::from_millis(250);
         let t = slint::Timer::default();
         t.start(
@@ -464,36 +531,103 @@ impl Runtime {
                         w.set_mouse_keys(true);
                     }
                 }
-                Self::sync_key_geom(&bridge, &w);
+
+                if bridge.take_display_change() && !windowed.get() {
+                    if let Some(m) = Self::pad_mon(&w) {
+                        log::info!("re-pinning pad to {} after display change", m.label);
+                        bridge.set_pinned(Some(touchbridge::PinRect {
+                            left: m.left,
+                            top: m.top,
+                            width: m.width.max(1),
+                            height: m.height.max(1),
+                        }));
+                        Self::repin_if_needed(&w);
+                    }
+                }
+
+                let geom = Self::key_geom_of(&w);
+                if geom != last_geom.get() {
+                    last_geom.set(geom);
+                    bridge.set_key_geom(geom);
+                }
+                let zones = Self::fader_zones_of(&w);
+                if zones != last_fader_zones.get() {
+                    last_fader_zones.set(zones);
+                    bridge.set_fader_geom(zones);
+                }
+                let fcfg = Self::fader_cfg_of(&w);
+                if fcfg != last_fader_cfg.get() {
+                    last_fader_cfg.set(fcfg);
+                    bridge.set_fader_cfg(fcfg);
+                }
                 Self::sync_keys_enabled(&bridge, &w);
+                bridge.expire_lost_contacts();
+                bridge.tick_faders();
+
+                let (fvals, fgrab, fdir) = bridge.fader_snapshot();
+                set_if_changed(fvals[0], w.get_fader_l(), |v| w.set_fader_l(v));
+                set_if_changed(fvals[1], w.get_fader_r(), |v| w.set_fader_r(v));
+                set_if_changed(fgrab[0], w.get_grabbed_l(), |v| w.set_grabbed_l(v));
+                set_if_changed(fgrab[1], w.get_grabbed_r(), |v| w.set_grabbed_r(v));
+                set_if_changed(fdir[0], w.get_dir_l(), |v| w.set_dir_l(v));
+                set_if_changed(fdir[1], w.get_dir_r(), |v| w.set_dir_r(v));
+
+                let diag_open = w.get_diagnostics();
+                if dirty.replace(false) || diag_open != last_diag_open.replace(diag_open) {
+                    Self::refresh_diagnostics(&w, &diag, &keys, &log);
+                }
 
                 if w.get_nav_active() {
-                    if let Some(frame) = nav.take_frame_after(nav_generation.get()) {
-                        nav_generation.set(frame.generation);
-                        w.set_nav_status(
-                            format!("{} · {:.1} ms", frame.status, frame.capture_ms).into(),
-                        );
-                        if frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty() {
-                            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                    let taken = nav.with_new_frame(nav_generation.get(), |frame| {
+                        let want = (frame.width as usize) * (frame.height as usize) * 4;
+                        let image = (want > 0 && frame.rgba.len() >= want).then(|| {
+                            Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
                                 &frame.rgba,
                                 frame.width,
                                 frame.height,
-                            );
-                            w.set_nav_frame(Image::from_rgba8(buf));
+                            ))
+                        });
+                        (
+                            frame.generation,
+                            format!("{} · {:.1} ms", frame.status, frame.capture_ms),
+                            image,
+                        )
+                    });
+                    if let Some((generation, status, image)) = taken {
+                        nav_generation.set(generation);
+                        w.set_nav_status(status.into());
+                        if let Some(image) = image {
+                            w.set_nav_frame(image);
                         }
                     }
                 }
 
                 let s = bridge.stats();
-                w.set_live_contacts(s.live as i32);
-                w.set_peak_contacts(s.peak as i32);
-                w.set_dropped_contacts(s.dropped as i32);
+                set_if_changed(s.live as i32, w.get_live_contacts(), |v| {
+                    w.set_live_contacts(v)
+                });
+                set_if_changed(s.peak as i32, w.get_peak_contacts(), |v| {
+                    w.set_peak_contacts(v)
+                });
+                set_if_changed(s.dropped as i32, w.get_dropped_contacts(), |v| {
+                    w.set_dropped_contacts(v)
+                });
                 match api.borrow().as_ref() {
                     Some(api) => {
-                        w.set_api_status(api.status().into());
-                        w.set_api_connected(api.connected());
+                        let epoch = api.status_epoch();
+                        if epoch != api_epoch.replace(epoch) {
+                            w.set_api_status(api.status().into());
+                        }
+                        set_if_changed(api.connected(), w.get_api_connected(), |v| {
+                            w.set_api_connected(v)
+                        });
                     }
-                    None => w.set_api_status("disabled".into()),
+                    None => {
+                        const DISABLED: u64 = u64::MAX;
+                        if api_epoch.replace(DISABLED) != DISABLED {
+                            w.set_api_status("disabled".into());
+                        }
+                    }
                 }
             },
         );

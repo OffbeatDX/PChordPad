@@ -1,9 +1,8 @@
 import { Theme } from "theme.slint";
-import { MultiTouch } from "multitouch.slint";
 import { PChordPanel } from "pchord.slint";
 import { MonitorSelect, ToggleTile, SliderRow } from "settings.slint";
 
-export { MultiTouch, Theme }
+export { Theme }
 
 component Stat inherits VerticalLayout {
     in property <string> label;
@@ -22,31 +21,6 @@ component Stat inherits VerticalLayout {
         color: root.tint;
         font-size: 19px;
         font-weight: 800;
-    }
-}
-
-component SlotDot inherits Rectangle {
-    in property <int> index;
-    in property <bool> active;
-    in property <length> px;
-    in property <length> py;
-    min-width: 72px;
-    height: 22px;
-    border-radius: 3px;
-    horizontal-stretch: 1;
-    background: root.active ? Theme.accent-a.with-alpha(0.18) : Theme.surface2.with-alpha(0.5);
-    border-width: 1px;
-    border-color: root.active ? Theme.accent-a : Theme.border;
-    Text {
-        width: 100%;
-        height: 100%;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        font-size: 10px;
-        color: root.active ? Theme.accent-a : Theme.text3;
-        text: root.active
-            ? root.index + ": " + Math.round(root.px / 1px) + "," + Math.round(root.py / 1px)
-            : root.index + ": —";
     }
 }
 
@@ -119,7 +93,6 @@ export component PChordWindow inherits Window {
     in property <int> live-contacts;
     in property <int> peak-contacts;
     in property <int> dropped-contacts;
-    in property <string> latency;
     in property <string> api-status;
     in property <bool> api-connected;
     in property <int> digital-events;
@@ -129,12 +102,21 @@ export component PChordWindow inherits Window {
 
     in-out property <float> fader-curve: 1.0;
     in-out property <float> fader-dead: 0.04;
-    in-out property <duration> fader-tick: 16ms;
     in-out property <float> fader-decay: 0.7;
     in-out property <bool> relative-faders: true;
     in-out property <float> fader-rel-travel: 100.0;
     in-out property <float> fader-speed-dead: 2.5;
+
+    in property <float> fader-l: 0.0;
+    in property <float> fader-r: 0.0;
+    in property <bool> grabbed-l: false;
+    in property <bool> grabbed-r: false;
+    in property <int> dir-l: 0;
+    in property <int> dir-r: 0;
+
     in-out property <float> playfield-fit: 1.0;
+    in-out property <float> key-height: 0.66;
+    in-out property <float> fader-pos: 0.0;
     in-out property <int> api-port: 1337;
     in-out property <bool> light-keys: false;
     in-out property <bool> flip-vertical: false;
@@ -159,9 +141,22 @@ export component PChordWindow inherits Window {
     out property <float> key-geom-h: panel.key-geom-h;
     out property <float> key-geom-key-w: panel.key-geom-key-w;
     out property <float> key-geom-gap: panel.key-geom-gap;
+
+    out property <float> fader-l-geom-x: panel.fader-l-zone-x;
+    out property <float> fader-l-geom-y: panel.fader-l-zone-y;
+    out property <float> fader-l-geom-w: panel.fader-l-zone-w;
+    out property <float> fader-l-geom-h: panel.fader-l-zone-h;
+    out property <float> fader-l-geom-center-x: panel.fader-l-center-x;
+    out property <float> fader-l-geom-half: panel.fader-l-half;
+    out property <float> fader-r-geom-x: panel.fader-r-zone-x;
+    out property <float> fader-r-geom-y: panel.fader-r-zone-y;
+    out property <float> fader-r-geom-w: panel.fader-r-zone-w;
+    out property <float> fader-r-geom-h: panel.fader-r-zone-h;
+    out property <float> fader-r-geom-center-x: panel.fader-r-center-x;
+    out property <float> fader-r-geom-half: panel.fader-r-half;
+
     out property <bool> keys-interactive: !root.settings-open && !root.nav-active;
 
-    callback analog(string, float);
     callback mouse-key(float, float, bool);
 
     property <length> band-h: root.diagnostics ? 110px : 0px;
@@ -172,44 +167,33 @@ export component PChordWindow inherits Window {
         y: root.band-h;
         width: root.width;
         height: max(1px, root.height - root.band-h);
-        interactive: !root.settings-open && !root.nav-active;
-        mt-enabled: !root.settings-open && !root.nav-active;
         key-held: root.keys;
-        fader-curve: root.fader-curve;
-        fader-dead: root.fader-dead;
-        fader-tick: root.fader-tick;
-        fader-decay: root.fader-decay;
-        relative-faders: root.relative-faders;
-        fader-rel-travel: root.fader-rel-travel * 1px;
-        fader-speed-dead: root.fader-speed-dead * 1px;
+        fader-l-value: root.fader-l;
+        fader-r-value: root.fader-r;
+        grabbed-l: root.grabbed-l;
+        grabbed-r: root.grabbed-r;
         fit: root.playfield-fit;
+        key-height: root.key-height;
+        fader-pos: root.fader-pos;
         light-keys: root.light-keys;
-        analog(n, v) => { root.analog(n, v); }
     }
 
     if root.mouse-keys : TouchArea {
-        x: root.key-geom-x * 1px;
-        y: (root.panel-y + root.key-geom-y) * 1px;
-        width: root.key-geom-w * 1px;
-        height: root.key-geom-h * 1px;
+        x: 0;
+        y: root.band-h;
+        width: root.width;
+        height: max(1px, root.height - root.band-h);
         moved => {
-            root.mouse-key(
-                root.key-geom-x + self.mouse-x / 1px,
-                root.panel-y + root.key-geom-y + self.mouse-y / 1px,
-                false);
+            if (self.pressed) {
+                root.mouse-key(self.mouse-x / 1px, (root.band-h + self.mouse-y) / 1px, false);
+            }
         }
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down) {
-                root.mouse-key(
-                    root.key-geom-x + self.mouse-x / 1px,
-                    root.panel-y + root.key-geom-y + self.mouse-y / 1px,
-                    false);
+                root.mouse-key(self.mouse-x / 1px, (root.band-h + self.mouse-y) / 1px, false);
             }
             if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
-                root.mouse-key(
-                    root.key-geom-x + self.mouse-x / 1px,
-                    root.panel-y + root.key-geom-y + self.mouse-y / 1px,
-                    true);
+                root.mouse-key(self.mouse-x / 1px, (root.band-h + self.mouse-y) / 1px, true);
             }
         }
     }
@@ -562,6 +546,50 @@ export component PChordWindow inherits Window {
                             }
                         }
                         SliderRow {
+                            label: "Key height";
+                            help: "How tall the note keys are, as a share of the playfield. Lower keys leave free space above them for the faders (see Fader position).";
+                            active-help: root.settings-help;
+                            min-v: 0.3;
+                            max-v: 0.85;
+                            default-value: 0.66;
+                            value <=> root.key-height;
+                            display: Math.round(root.key-height * 100) + "%";
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
+                            label: "Fader position";
+                            help: "Where the faders sit in the free space above the keys. 0% = as high as possible; 100% = dropped down just above the keys. Only has room to move when Key height is lowered.";
+                            active-help: root.settings-help;
+                            min-v: 0.0;
+                            max-v: 1.0;
+                            default-value: 0.0;
+                            value <=> root.fader-pos;
+                            display: Math.round(root.fader-pos * 100) + "%";
+                            ask-help(t, ax, ay) => {
+                                if root.settings-help == t {
+                                    root.settings-help = "";
+                                } else {
+                                    root.settings-help = t;
+                                    root.settings-help-abs-x = ax;
+                                    root.settings-help-abs-y = ay;
+                                }
+                            }
+                            dismiss-help => {
+                                root.settings-help = "";
+                            }
+                        }
+                        SliderRow {
                             label: "Spring decay";
                             help: "How fast a released fader returns to center. Higher = snappier spring; lower = slower glide back to 0.";
                             active-help: root.settings-help;
@@ -792,11 +820,6 @@ export component PChordWindow inherits Window {
             VerticalLayout {
                 spacing: 2px;
                 Text {
-                    text: "latency " + root.latency;
-                    font-size: 11px;
-                    color: Theme.text2;
-                }
-                Text {
                     text: root.digital-events + " dig / " + root.analog-events + " an";
                     font-size: 11px;
                     color: Theme.text3;
@@ -894,16 +917,16 @@ export component PChordWindow inherits Window {
                 alignment: start;
                 FaderReadout {
                     label: "FADER-L";
-                    value: panel.fader-l;
-                    dir: panel.dir-l;
-                    grabbed: panel.grabbed-l;
+                    value: root.fader-l;
+                    dir: root.dir-l;
+                    grabbed: root.grabbed-l;
                     accent: Theme.fader-l;
                 }
                 FaderReadout {
                     label: "FADER-R";
-                    value: panel.fader-r;
-                    dir: panel.dir-r;
-                    grabbed: panel.grabbed-r;
+                    value: root.fader-r;
+                    dir: root.dir-r;
+                    grabbed: root.grabbed-r;
                     accent: Theme.fader-r;
                 }
             }
@@ -914,23 +937,36 @@ export component PChordWindow inherits Window {
                 height: 100%;
                 alignment: start;
                 Text {
-                    text: "TOUCH SLOTS";
+                    text: "CONTACTS";
                     font-size: 9px;
                     font-weight: 700;
                     letter-spacing: 1px;
                     color: Theme.text3;
                 }
                 HorizontalLayout {
-                    spacing: 4px;
-                    SlotDot { index: 0; active: MultiTouch.a0; px: MultiTouch.x0; py: MultiTouch.y0; }
-                    SlotDot { index: 1; active: MultiTouch.a1; px: MultiTouch.x1; py: MultiTouch.y1; }
-                    SlotDot { index: 2; active: MultiTouch.a2; px: MultiTouch.x2; py: MultiTouch.y2; }
-                    SlotDot { index: 3; active: MultiTouch.a3; px: MultiTouch.x3; py: MultiTouch.y3; }
-                    SlotDot { index: 4; active: MultiTouch.a4; px: MultiTouch.x4; py: MultiTouch.y4; }
-                    SlotDot { index: 5; active: MultiTouch.a5; px: MultiTouch.x5; py: MultiTouch.y5; }
-                    SlotDot { index: 6; active: MultiTouch.a6; px: MultiTouch.x6; py: MultiTouch.y6; }
-                    SlotDot { index: 7; active: MultiTouch.a7; px: MultiTouch.x7; py: MultiTouch.y7; }
-                    SlotDot { index: 8; active: MultiTouch.a8; px: MultiTouch.x8; py: MultiTouch.y8; }
+                    spacing: 16px;
+                    alignment: start;
+                    Text {
+                        text: "live " + root.live-contacts;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: root.live-contacts > 0 ? Theme.ok : Theme.text3;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "peak " + root.peak-contacts;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: Theme.text2;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "dropped " + root.dropped-contacts;
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: root.dropped-contacts > 0 ? Theme.bad : Theme.text3;
+                        vertical-alignment: center;
+                    }
                 }
             }
 

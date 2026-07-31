@@ -93,9 +93,9 @@ impl NavMirror {
         }
     }
 
-    pub fn take_frame_after(&self, generation: u64) -> Option<Frame> {
+    pub fn with_new_frame<R>(&self, generation: u64, f: impl FnOnce(&Frame) -> R) -> Option<R> {
         let frame = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
-        (frame.generation != generation).then(|| frame.clone())
+        (frame.generation != generation).then(|| f(&frame))
     }
 
     pub fn pointer(&self, nx: f32, ny: f32, kind: i32) {
@@ -136,8 +136,10 @@ impl Drop for NavMirror {
 }
 
 const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
+const FRAME_SLOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
+    let mut capturer = Capturer::default();
     loop {
         let (target, epoch) = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -152,7 +154,7 @@ fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
         let Some(mon) = target else { continue };
 
         let started = std::time::Instant::now();
-        let result = capture_monitor(&mon, max_w);
+        let result = capturer.capture(&mon, max_w);
         let elapsed = started.elapsed();
         {
             let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -161,20 +163,20 @@ fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
             }
         }
         let mut frame = shared.frame.lock().unwrap_or_else(|e| e.into_inner());
-        let generation = frame.generation.wrapping_add(1);
+        frame.generation = frame.generation.wrapping_add(1);
+        frame.capture_ms = elapsed.as_secs_f32() * 1000.0;
         match result {
-            Ok(mut next) => {
-                next.generation = generation;
-                next.capture_ms = elapsed.as_secs_f32() * 1000.0;
-                if elapsed > FRAME_BUDGET {
-                    log::warn!("nav capture took {:.1} ms", next.capture_ms);
+            Ok(shot) => {
+                if elapsed > FRAME_SLOW {
+                    log::warn!("nav capture took {:.1} ms", frame.capture_ms);
                 }
-                *frame = next;
+                frame.width = shot.width;
+                frame.height = shot.height;
+                frame.status = shot.status;
+                std::mem::swap(&mut frame.rgba, capturer.pixels_mut());
             }
             Err(e) => {
                 frame.status = format!("capture failed: {e}");
-                frame.generation = generation;
-                frame.capture_ms = elapsed.as_secs_f32() * 1000.0;
             }
         }
         drop(frame);
@@ -183,7 +185,7 @@ fn capture_worker(shared: Arc<CaptureShared>, max_w: u32) {
         if state.stop {
             return;
         }
-        let wait = FRAME_BUDGET.saturating_sub(elapsed);
+        let wait = FRAME_BUDGET.saturating_sub(elapsed).max(elapsed);
         if wait.is_zero() {
             continue;
         }
@@ -321,15 +323,13 @@ fn inject_mouse_up(nav: &NavMirror) {
     );
 }
 
-#[cfg(windows)]
-fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
-        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
-    };
+struct Shot {
+    width: u32,
+    height: u32,
+    status: String,
+}
 
+fn target_size(mon: &MonInfo, max_w: u32) -> (u32, u32, u32, u32) {
     let src_w = mon.width.max(1) as u32;
     let src_h = mon.height.max(1) as u32;
     let scale = if src_w > max_w {
@@ -339,28 +339,84 @@ fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
     };
     let dst_w = ((src_w as f32 * scale).round() as u32).max(1);
     let dst_h = ((src_h as f32 * scale).round() as u32).max(1);
+    (src_w, src_h, dst_w, dst_h)
+}
 
-    unsafe {
-        let screen_dc: HDC = GetDC(0 as HWND);
-        if screen_dc.is_null() {
-            return Err("GetDC failed".into());
+fn shot_status(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> String {
+    if dst_w == src_w {
+        format!("NAV  {src_w}×{src_h}  ·  touch = main screen")
+    } else {
+        format!("NAV  {src_w}×{src_h}→{dst_w}×{dst_h}  ·  touch = main screen")
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct Capturer {
+    surface: Option<Surface>,
+    pixels: Vec<u8>,
+}
+
+#[cfg(windows)]
+struct Surface {
+    mem_dc: windows_sys::Win32::Graphics::Gdi::HDC,
+    bmp: windows_sys::Win32::Graphics::Gdi::HBITMAP,
+    old: windows_sys::Win32::Graphics::Gdi::HGDIOBJ,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(windows)]
+impl Drop for Surface {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
+        unsafe {
+            SelectObject(self.mem_dc, self.old);
+            DeleteObject(self.bmp as _);
+            DeleteDC(self.mem_dc);
         }
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        if mem_dc.is_null() {
-            ReleaseDC(0 as HWND, screen_dc);
-            return Err("CreateCompatibleDC failed".into());
+    }
+}
+
+#[cfg(windows)]
+impl Capturer {
+    fn pixels_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.pixels
+    }
+
+    fn capture(&mut self, mon: &MonInfo, max_w: u32) -> Result<Shot, String> {
+        use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        unsafe {
+            let screen_dc = GetDC(std::ptr::null_mut());
+            if screen_dc.is_null() {
+                return Err("GetDC failed".into());
+            }
+            let out = self.capture_onto(screen_dc, mon, max_w);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            out
         }
-        let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, dst_w as i32, dst_h as i32);
-        if bmp.is_null() {
-            DeleteDC(mem_dc);
-            ReleaseDC(0 as HWND, screen_dc);
-            return Err("CreateCompatibleBitmap failed".into());
-        }
-        let old: HGDIOBJ = SelectObject(mem_dc, bmp as HGDIOBJ);
+    }
+
+    unsafe fn capture_onto(
+        &mut self,
+        screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
+        mon: &MonInfo,
+        max_w: u32,
+    ) -> Result<Shot, String> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            BitBlt, GetDIBits, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS, HALFTONE, SRCCOPY,
+        };
+
+        let (src_w, src_h, dst_w, dst_h) = target_size(mon, max_w);
+        self.ensure_surface(screen_dc, dst_w, dst_h)?;
+        let Some(surface) = self.surface.as_ref() else {
+            return Err("no capture surface".into());
+        };
 
         let ok = if dst_w == src_w && dst_h == src_h {
             BitBlt(
-                mem_dc,
+                surface.mem_dc,
                 0,
                 0,
                 dst_w as i32,
@@ -371,9 +427,9 @@ fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
                 SRCCOPY,
             )
         } else {
-            SetStretchBltMode(mem_dc, HALFTONE);
+            SetStretchBltMode(surface.mem_dc, HALFTONE);
             StretchBlt(
-                mem_dc,
+                surface.mem_dc,
                 0,
                 0,
                 dst_w as i32,
@@ -386,12 +442,8 @@ fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
                 SRCCOPY,
             )
         };
-
         if ok == 0 {
-            SelectObject(mem_dc, old);
-            DeleteObject(bmp as HGDIOBJ);
-            DeleteDC(mem_dc);
-            ReleaseDC(0 as HWND, screen_dc);
+            self.surface = None;
             return Err("BitBlt/StretchBlt failed".into());
         }
 
@@ -403,54 +455,92 @@ fn capture_monitor(mon: &MonInfo, max_w: u32) -> Result<Frame, String> {
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
 
-        let mut bgra = vec![0u8; (dst_w * dst_h * 4) as usize];
+        let needed = (dst_w as usize) * (dst_h as usize) * 4;
+        self.pixels.resize(needed, 0);
         let got = GetDIBits(
-            mem_dc,
-            bmp,
+            surface.mem_dc,
+            surface.bmp,
             0,
             dst_h,
-            bgra.as_mut_ptr() as *mut _,
+            self.pixels.as_mut_ptr() as *mut _,
             &mut info,
             DIB_RGB_COLORS,
         );
-
-        SelectObject(mem_dc, old);
-        DeleteObject(bmp as HGDIOBJ);
-        DeleteDC(mem_dc);
-        ReleaseDC(0 as HWND, screen_dc);
-
         if got == 0 {
             return Err("GetDIBits failed".into());
         }
 
-        Ok(Frame {
+        bgra_to_rgba_in_place(&mut self.pixels);
+        Ok(Shot {
             width: dst_w,
             height: dst_h,
-            rgba: bgra_to_rgba(&bgra),
-            status: if dst_w == src_w {
-                format!("NAV  {src_w}×{src_h}  ·  touch = main screen")
-            } else {
-                format!("NAV  {src_w}×{src_h}→{dst_w}×{dst_h}  ·  touch = main screen")
-            },
-            ..Frame::default()
+            status: shot_status(src_w, src_h, dst_w, dst_h),
         })
+    }
+
+    unsafe fn ensure_surface(
+        &mut self,
+        screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, SelectObject,
+        };
+
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|s| s.width == width && s.height == height)
+        {
+            return Ok(());
+        }
+        self.surface = None;
+
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_null() {
+            return Err("CreateCompatibleDC failed".into());
+        }
+
+        let bmp = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
+        if bmp.is_null() {
+            DeleteDC(mem_dc);
+            return Err("CreateCompatibleBitmap failed".into());
+        }
+        let old = SelectObject(mem_dc, bmp as _);
+        self.surface = Some(Surface {
+            mem_dc,
+            bmp,
+            old,
+            width,
+            height,
+        });
+        Ok(())
     }
 }
 
 #[cfg(not(windows))]
-fn capture_monitor(_mon: &MonInfo, _max_w: u32) -> Result<Frame, String> {
-    Err("Nav mirror is Windows-only".into())
+#[derive(Default)]
+struct Capturer {
+    pixels: Vec<u8>,
 }
 
-pub fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for chunk in bgra.chunks_exact(4) {
-        rgba.push(chunk[2]);
-        rgba.push(chunk[1]);
-        rgba.push(chunk[0]);
-        rgba.push(255);
+#[cfg(not(windows))]
+impl Capturer {
+    fn pixels_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.pixels
     }
-    rgba
+
+    fn capture(&mut self, _mon: &MonInfo, _max_w: u32) -> Result<Shot, String> {
+        Err("Nav mirror is Windows-only".into())
+    }
+}
+
+pub fn bgra_to_rgba_in_place(buf: &mut [u8]) {
+    for px in buf.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
 }
 
 #[cfg(test)]
@@ -470,25 +560,33 @@ mod tests {
         }
     }
 
+    fn peek(nav: &NavMirror, generation: u64) -> Option<(u64, String)> {
+        nav.with_new_frame(generation, |f| (f.generation, f.status.clone()))
+    }
+
     #[test]
     fn bgra_conversion_is_rgba_and_opaque() {
-        assert_eq!(
-            bgra_to_rgba(&[3, 2, 1, 9, 30, 20, 10, 0]),
-            vec![1, 2, 3, 255, 10, 20, 30, 255]
-        );
+        let mut px = [3, 2, 1, 9, 30, 20, 10, 0];
+        bgra_to_rgba_in_place(&mut px);
+        assert_eq!(px, [1, 2, 3, 255, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn a_partial_pixel_is_left_alone_rather_than_panicking() {
+        let mut px = [3, 2, 1];
+        bgra_to_rgba_in_place(&mut px);
+        assert_eq!(px, [3, 2, 1]);
     }
 
     #[test]
     fn frame_generation_only_yields_new_frames() {
         let nav = NavMirror::new();
-        let first = nav.take_frame_after(u64::MAX).expect("initial frame");
-        assert!(nav.take_frame_after(first.generation).is_none());
+        let (generation, _) = peek(&nav, u64::MAX).expect("initial frame");
+        assert!(peek(&nav, generation).is_none());
         nav.set_status("changed");
-        let changed = nav
-            .take_frame_after(first.generation)
-            .expect("changed frame");
-        assert_eq!(changed.status, "changed");
-        assert_ne!(changed.generation, first.generation);
+        let (next, status) = peek(&nav, generation).expect("changed frame");
+        assert_eq!(status, "changed");
+        assert_ne!(next, generation);
     }
 
     #[test]
@@ -526,8 +624,35 @@ mod tests {
             let state = nav.shared.state.lock().unwrap();
             assert!(!state.running);
         }
-        let frame = nav.take_frame_after(u64::MAX).expect("status frame");
-        assert_eq!(frame.status, "idle");
+        let (_, status) = peek(&nav, u64::MAX).expect("status frame");
+        assert_eq!(status, "idle");
+    }
+
+    #[test]
+    #[ignore = "measurement against the live desktop; not a CI assertion"]
+    #[cfg(windows)]
+    fn measure_capture_cost() {
+        let mut mon = crate::monitor::enumerate()
+            .first()
+            .expect("a monitor")
+            .clone();
+        mon.width = 1920;
+        mon.height = 1080;
+        let mut cap = Capturer::default();
+        for _ in 0..5 {
+            let _ = cap.capture(&mon, 1920);
+        }
+        let mut times = Vec::new();
+        for _ in 0..60 {
+            let t = std::time::Instant::now();
+            cap.capture(&mon, 1920).expect("capture");
+            times.push(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "capture {}×{} p50={:.2}ms p90={:.2}ms max={:.2}ms",
+            mon.width, mon.height, times[30], times[54], times[59]
+        );
     }
 
     #[test]

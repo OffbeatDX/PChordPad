@@ -2,6 +2,7 @@
 
 mod config;
 mod diagnostics;
+mod faders;
 mod monitor;
 mod navmirror;
 mod runtime;
@@ -12,6 +13,16 @@ use config::Config;
 use runtime::Runtime;
 
 slint::include_modules!();
+
+pub(crate) fn stamp(elapsed: std::time::Duration) -> String {
+    let ms = elapsed.as_millis();
+    format!(
+        "{:02}:{:02}.{:03}",
+        ms / 60_000,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
 
 fn main() -> Result<(), slint::PlatformError> {
     init_logging();
@@ -74,13 +85,7 @@ fn init_logging() {
         }
         fn log(&self, r: &log::Record) {
             use std::sync::atomic::Ordering;
-            let ms = self.start.elapsed().as_millis();
-            let stamp = format!(
-                "{:02}:{:02}.{:03}",
-                ms / 60_000,
-                (ms / 1000) % 60,
-                ms % 1000
-            );
+            let stamp = crate::stamp(self.start.elapsed());
             let line = format!("[{stamp}] [{:<5}] {}\n", r.level(), r.args());
             let Ok(g) = self.tx.lock() else { return };
             let Some(tx) = g.as_ref() else { return };

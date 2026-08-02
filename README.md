@@ -1,4 +1,4 @@
-# PChordPad
+# PChordPad / [popnPad](https://github.com/OffbeatDX/popnPad)
 
 Touch pad for PChord under [spice2x](https://spice2x.github.io/).
 
